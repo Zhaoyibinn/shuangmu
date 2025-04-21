@@ -2,12 +2,13 @@ import cv2
 import os
  
 img_list = []
-input_path = r"C:\Users\ZhaoYibin\Desktop\SDK_MVCamCtrl_Win_STD_V4.5.1_V2.5.1\shuangmu\right"  # 要处理的图片所在的文件夹
-output_path = r"C:\Users\ZhaoYibin\Desktop\SDK_MVCamCtrl_Win_STD_V4.5.1_V2.5.1\shuangmu\gray\right"  # 处理完的图片放在这里
+input_path = r"C:\Users\ZhaoYibin\Desktop\SDK_MVCamCtrl_Win_STD_V4.5.1_V2.5.1\shuangmu\imgs\realsense\color\right"  # 要处理的图片所在的文件夹
+output_path = r"C:\Users\ZhaoYibin\Desktop\SDK_MVCamCtrl_Win_STD_V4.5.1_V2.5.1\shuangmu\imgs\realsense\gray\right"  # 处理完的图片放在这里
 for item in os.listdir(input_path):
     img_list.append(os.path.join(input_path, item))
 print(list)
 count = 1
+img_list.sort()
 for imagepath in img_list:
     # print(imagepath)
     image = cv2.imread(imagepath, cv2.IMREAD_GRAYSCALE)
