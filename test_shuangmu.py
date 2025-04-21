@@ -3,8 +3,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import open3d as o3d
 
-left_img_path = "imgs\\realsense\color\left\depth_2_1887.png"
-right_img_path = "imgs\\realsense\color\\right\color_1_1887.png"
+left_img_path = "imgs/realsense/color/left/depth_2_1887.png"
+right_img_path = "imgs/realsense/color/right/color_1_1887.png"
 
 left_img = cv2.imread(left_img_path)
 right_img = cv2.imread(right_img_path)

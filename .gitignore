@@ -1,1 +1,4 @@
 imgs
+test.png
+*.pyc
+realsense_capture

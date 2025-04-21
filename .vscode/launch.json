@@ -12,6 +12,40 @@
             "program": "${workspaceFolder}/test_shuangmu.py",
             "console": "integratedTerminal",
             "args": []
+        },
+        {
+            "name": "shuangmu_lg",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/shuangmu_lg.py",
+            "pythonPath":"/home/zhaoyibin/anaconda3/envs/lightglue/bin/python",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
+            "name": "realsense_capture",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/realsense_capture.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
+            "name": "realsense2_capture",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/realsense2_capture.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
+            "name": "realsense_shuangmu",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/realsense_shuangmu.py",
+            "pythonPath":"/home/zhaoyibin/anaconda3/envs/lightglue/bin/python",
+            "console": "integratedTerminal",
+            "args": []
         }
     ]
 }
