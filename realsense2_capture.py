@@ -60,7 +60,7 @@ else:
                 if not os.path.exists(folder_path):
                     os.makedirs(folder_path)
                 cv2.imwrite(f"realsense_capture/color_1_{now_id}.png",color_image1)
-                cv2.imwrite(f"realsense_capture/depth_2_{now_id}.png",color_image2)
+                cv2.imwrite(f"realsense_capture/color_2_{now_id}.png",color_image2)
 
                 print(f"图像已保存为 color_1_{now_id}.png 和 depth_2_{now_id}.png")
             # 按 'q' 键退出循环
