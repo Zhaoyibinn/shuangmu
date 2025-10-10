@@ -1,0 +1,31 @@
+
+=== 双目立体矫正与基线计算报告 ===
+
+输入文件:
+- 左图: whx_biaoding/rosL1.png
+- 右图: whx_biaoding/rosR1.png
+- 内参: biaoding/intrinsics_d435_20250915.yml
+- 外参: biaoding/extrinsics_d435_20250915.yml
+
+图像信息:
+- 分辨率: 640x480
+- 校正参数alpha: 0.0
+
+基线计算结果:
+- 方法1(从T): 95.149900 mm
+- 方法2(从P2): 95.149900 mm
+- 方法3(从Q): 95.149900 mm
+- 最大差异: 0.000000 mm
+- 最终基线: 95.149900 mm (0.095150 m)
+
+输出文件:
+- 左图矫正: stereo_output/left_rect.png
+- 右图矫正: stereo_output/right_rect.png
+- FoundationStereo内参: stereo_output/intrinsics.txt
+- 极线验证图: stereo_output/combined_with_epipolar_lines.png
+
+相机参数:
+- 矫正后焦距fx: 396.01
+- 矫正后焦距fy: 396.01
+- 矫正后主点cx: 321.49
+- 矫正后主点cy: 242.45

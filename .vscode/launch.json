@@ -34,6 +34,14 @@
             "name": "jiegouguang_detectcircle",
             "type": "debugpy",
             "request": "launch",
+            "program": "stereo_rectify_baseline.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
+            "name": "jiegouguang_detectcircle",
+            "type": "debugpy",
+            "request": "launch",
             "program": "jiegouguang/jiegouguang_main.py",
             "console": "integratedTerminal",
             "args": []
