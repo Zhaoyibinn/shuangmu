@@ -9,6 +9,7 @@ from LightGlue_feature.NeuralFeature import NeuralFeatureJieGouGuang
 from sgbm.sgbm import SGBM
 from FoundationStereo.stereo_inference import StereoInference
 from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
+from color import ColorMapper  # 颜色映射模块 - DX
 
 class JieGouGuang:
     def __init__(self,img1_path,img2_path):
@@ -56,6 +57,9 @@ class JieGouGuang:
         # 按照亮度过滤的参数
 
         self.method = None
+
+        # 初始化颜色映射器 - DX
+        self.color_mapper = ColorMapper()
 
     def import_biaodin(self,extri_path,intri_path,idx = 0):
         current_img1 = self.img1_list[idx]
@@ -327,4 +331,18 @@ class JieGouGuang:
 
         self.pcd = pcd
         return pcd
-        
+
+    def get_rgbd(self, depth_L: np.ndarray, rgb_img: np.ndarray) -> np.ndarray:
+        """
+        获取RGBD图（四通道） - DX
+
+        参数:
+            depth_L: 深度图 HxW (float32, 单位:米)
+            rgb_img: RGB图像 HxWx3 (uint8)
+
+        返回:
+            rgbd: HxWx4 数组
+                  - rgbd[:,:,0:3] = RGB颜色 (uint8)
+                  - rgbd[:,:,3] = 深度值 (float32, 米)
+        """
+        return self.color_mapper.get_color(depth_L, rgb_img, self.K1)
