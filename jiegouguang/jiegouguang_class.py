@@ -12,18 +12,21 @@ from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
 from color import ColorMapper  # 颜色映射模块 - DX
 
 class JieGouGuang:
-    def __init__(self,img1_path,img2_path):
+    def __init__(self,img1_path,img2_path,img_rgb_path = None):
         # self.img1_path = img1_path
         # self.img2_path = img2_path
 
-        def _load_media_sequence(path):
+        def _load_media_sequence(path,color = False):
             """Load an image or every frame from a video into a grayscale list."""
             frames = []
             cap = cv2.VideoCapture(path)
             if cap.isOpened():
                 ret, frame = cap.read()
                 while ret:
-                    frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                    if not color:
+                        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                    else:
+                        frames.append(frame)
                     ret, frame = cap.read()
                 cap.release()
                 if frames:
@@ -38,6 +41,10 @@ class JieGouGuang:
 
         self.img1_list = _load_media_sequence(img1_path)
         self.img2_list = _load_media_sequence(img2_path)
+        if img_rgb_path is not None:
+            self.img_rgb_list = _load_media_sequence(img_rgb_path,color=True)
+        else:
+            self.img_rgb_list = None
 
         # self.img1 = self.img1_list[0]
         # self.img2 = self.img2_list[0]

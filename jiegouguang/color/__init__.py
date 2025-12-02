@@ -110,6 +110,8 @@ class ColorMapper:
 
         du = (u_C_in - u0)[:, None]
         dv = (v_C_in - v0)[:, None]
+        # du = (u_C_in - u0)
+        # dv = (v_C_in - v0)
 
         colors = (
             (1 - du) * (1 - dv) * rgb_img[v0, u0].astype(np.float32) +
