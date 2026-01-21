@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import copy
 import open3d as o3d
+from pathlib import Path
 
 # 下面都是自己实现的各种方法
 from manual_feature.ManualFeature import ManualFeatureJieGouGuang
@@ -17,27 +18,49 @@ class JieGouGuang:
         # self.img2_path = img2_path
 
         def _load_media_sequence(path,color = False):
-            """Load an image or every frame from a video into a grayscale list."""
+            """Load an image, video, or its directory into a list."""
+            path = Path(path)
             frames = []
-            cap = cv2.VideoCapture(path)
-            if cap.isOpened():
-                ret, frame = cap.read()
-                while ret:
-                    if not color:
-                        frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
-                    else:
-                        frames.append(frame)
-                    ret, frame = cap.read()
-                cap.release()
-                if frames:
-                    return frames
-            else:
-                cap.release()
+            if path.is_dir():
+                supported_exts = {".png", ".jpg", ".jpeg", ".bmp"}
+                images = sorted(
+                    p for p in path.iterdir() if p.is_file() and p.suffix.lower() in supported_exts
+                )
+                if not images:
+                    raise ValueError(f'目录不包含支持的图像：{path}')
+                for img_path in images:
+                    img = cv2.imread(str(img_path))
+                    if img is None:
+                        raise ValueError(f'failed to read image {img_path}')
+                    if not color and img.ndim == 3:
+                        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                    elif color and img.ndim == 2:
+                        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                    frames.append(img)
+                return frames
 
-            img = cv2.imread(path)
-            if img is None:
-                raise ValueError(f'failed to read media from {path}')
-            return [cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)]
+            cap = cv2.VideoCapture(str(path))
+            try:
+                if cap.isOpened():
+                    ret, frame = cap.read()
+                    while ret:
+                        if not color:
+                            frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+                        else:
+                            frames.append(frame)
+                        ret, frame = cap.read()
+                    if frames:
+                        return frames
+                img = cv2.imread(str(path))
+                if img is None:
+                    raise ValueError(f'failed to read media from {path}')
+                if not color and img.ndim == 3:
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+                elif color and img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                return [img]
+            finally:
+                cap.release()
 
         self.img1_list = _load_media_sequence(img1_path)
         self.img2_list = _load_media_sequence(img2_path)

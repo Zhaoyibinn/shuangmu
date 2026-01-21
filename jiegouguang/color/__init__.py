@@ -19,7 +19,7 @@ class ColorMapper:
             yaml_path: rgb_calib.yaml 路径，默认为同目录下的文件
         """
         if yaml_path is None:
-            yaml_path = os.path.join(os.path.dirname(__file__), 'rgb_calib.yaml')
+            yaml_path = os.path.join(os.path.dirname(__file__), 'rgb_calib_zyb_20250121.yaml')
 
         with open(yaml_path, 'r') as f:
             cfg = yaml.safe_load(f)
@@ -36,13 +36,15 @@ class ColorMapper:
         extr = cfg['rgb_extrinsics']
         self.R_L2RGB = np.array(extr['rotation'], dtype=np.float32).reshape(3, 3)
         self.t_L2RGB = np.array(extr['translation'], dtype=np.float32).reshape(3, 1)
+        self.R_L2RGB = self.R_L2RGB.T
+        # self.t_L2RGB = -self.R_L2RGB.T @ self.t_L2RGB
 
     def get_color(self,
                   depth_L: np.ndarray,
                   rgb_img: np.ndarray,
                   K_L: np.ndarray) -> np.ndarray:
         """
-        深度图 + RGB → RGBD（四通道）
+        深度图对齐到RGB坐标系 → RGBD（四通道）
 
         参数:
             depth_L: 左目深度图 HxW (float32, 单位:米)
@@ -50,15 +52,15 @@ class ColorMapper:
             K_L: 左目内参 3x3
 
         返回:
-            rgbd: HxWx4 数组
+            rgbd: HxWx4 数组（RGB图像尺寸）
                   - rgbd[:,:,0:3] = RGB颜色 (uint8)
                   - rgbd[:,:,3] = 深度值 (float32, 米)
         """
         H, W = depth_L.shape
-
+        h_c, w_c = rgb_img.shape[:2]
         # 初始化RGBD（float32存储，方便D通道）
-        rgbd = np.zeros((H, W, 4), dtype=np.float32)
-        rgbd[:, :, 3] = depth_L  # D通道
+        rgbd = np.zeros((h_c, w_c, 4), dtype=np.float32)
+        rgbd[:, :, :3] = rgb_img.astype(np.float32)
 
         # 有效深度掩码
         valid = depth_L > 0
@@ -93,36 +95,26 @@ class ColorMapper:
         u_C[valid_z] = fx_C * X_C[valid_z] / Z_C[valid_z] + cx_C
         v_C[valid_z] = fy_C * Y_C[valid_z] / Z_C[valid_z] + cy_C
 
-        # 边界检查（双线性插值需要访问相邻像素）
-        h_c, w_c = rgb_img.shape[:2]
-        inside = valid_z & (u_C >= 0) & (u_C < w_c - 1) & (v_C >= 0) & (v_C < h_c - 1)
+        # 边界检查（深度对齐到RGB像素）
+        u_C_round = np.round(u_C).astype(np.int32)
+        v_C_round = np.round(v_C).astype(np.int32)
+        inside = valid_z & (u_C_round >= 0) & (u_C_round < w_c) & (v_C_round >= 0) & (v_C_round < h_c)
 
         if not np.any(inside):
             return rgbd
 
-        # 双线性插值取色
-        u_C_in = u_C[inside]
-        v_C_in = v_C[inside]
+        # 深度写入RGB像素（使用Z_C作为RGB相机坐标系深度）
+        u_in = u_C_round[inside]
+        v_in = v_C_round[inside]
+        z_in = Z_C[inside]
 
-        u0 = np.floor(u_C_in).astype(np.int32)
-        v0 = np.floor(v_C_in).astype(np.int32)
-        u1, v1 = u0 + 1, v0 + 1
+        depth_rgb = np.full((h_c, w_c), np.inf, dtype=np.float32)
+        flat_idx = v_in * w_c + u_in
+        depth_flat = depth_rgb.reshape(-1)
+        np.minimum.at(depth_flat, flat_idx, z_in)
+        depth_rgb = depth_flat.reshape(h_c, w_c)
+        depth_rgb[~np.isfinite(depth_rgb)] = 0
 
-        du = (u_C_in - u0)[:, None]
-        dv = (v_C_in - v0)[:, None]
-        # du = (u_C_in - u0)
-        # dv = (v_C_in - v0)
-
-        colors = (
-            (1 - du) * (1 - dv) * rgb_img[v0, u0].astype(np.float32) +
-            du * (1 - dv) * rgb_img[v0, u1].astype(np.float32) +
-            (1 - du) * dv * rgb_img[v1, u0].astype(np.float32) +
-            du * dv * rgb_img[v1, u1].astype(np.float32)
-        )
-
-        # 写入RGBD的RGB通道
-        v_L_in = v_valid[inside].astype(np.int32)
-        u_L_in = u_valid[inside].astype(np.int32)
-        rgbd[v_L_in, u_L_in, :3] = colors
+        rgbd[:, :, 3] = depth_rgb
 
         return rgbd
