@@ -5,6 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "name": "main",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
             "name": "jiegouguang_main",
             "type": "debugpy",
             "request": "launch",

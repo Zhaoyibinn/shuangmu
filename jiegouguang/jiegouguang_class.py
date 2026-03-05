@@ -3,6 +3,10 @@ import numpy as np
 import copy
 import open3d as o3d
 from pathlib import Path
+import sys
+import os
+
+sys.path.append(os.path.dirname(__file__))
 
 # 下面都是自己实现的各种方法
 from manual_feature.ManualFeature import ManualFeatureJieGouGuang

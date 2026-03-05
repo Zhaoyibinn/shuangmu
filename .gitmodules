@@ -1,0 +1,3 @@
+[submodule "submodule/ultralytics"]
+	path = submodule/ultralytics
+	url = https://github.com/Zhaoyibinn/ultralytics_sam3

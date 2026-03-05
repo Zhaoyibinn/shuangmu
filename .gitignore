@@ -14,3 +14,6 @@ wucha/stereo_fullfactorial_Zsweep.csv
 .vscode/*
 jiegouguang/weights/*
 depth_outputs
+huojian
+*.ts
+*.pt
