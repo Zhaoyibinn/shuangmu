@@ -13,6 +13,14 @@
             "args": []
         },
         {
+            "name": "reg",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "reg.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
             "name": "jiegouguang_main",
             "type": "debugpy",
             "request": "launch",

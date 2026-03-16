@@ -14,6 +14,7 @@ from LightGlue_feature.NeuralFeature import NeuralFeatureJieGouGuang
 from sgbm.sgbm import SGBM
 from FoundationStereo.stereo_inference import StereoInference
 from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
+from fast_FoundationStereo.fast_stereo_inference import FastStereoInference
 from color import ColorMapper  # 颜色映射模块 - DX
 
 class JieGouGuang:
@@ -164,6 +165,9 @@ class JieGouGuang:
         elif self.method == 'bridgedepth':
             disparity_raw = self.bridgedepth_stereo_matching()
             return disparity_raw
+        elif self.method == 'fast_foundation_stereo':
+            disparity_raw = self.fast_foundation_stereo()
+            return disparity_raw
 
     def init_model(self):
         if self.method == 'sgbm':
@@ -180,6 +184,11 @@ class JieGouGuang:
                 model_name=model_name, 
                 device=device
             )
+        elif self.method == 'fast_foundation_stereo':
+            self.processor = FastStereoInference(
+                "jiegouguang/weights/fast_FoundationStereo/23-36-37/model_best_bp2_serialize.pth"
+            )
+        
 
 
     def manual_feature_extracting(self):
@@ -209,6 +218,14 @@ class JieGouGuang:
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(pcd_np)
         # self.pcd = pcd
+        return results['disparity']
+
+
+    def fast_foundation_stereo(self):
+        results = self.processor.infer(
+            self.img1_rectify, self.img2_rectify,
+            self.K1, abs(float(self.cam_t[0]))
+        )
         return results['disparity']
 
 
