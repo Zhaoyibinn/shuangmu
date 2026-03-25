@@ -5,6 +5,17 @@ import torch.nn.functional as F
 import numpy as np
 
 
+def _optional_torch_compile(func):
+    if not hasattr(torch, 'compile'):
+        return func
+    try:
+        import triton  # noqa: F401
+    except Exception:
+        if torch.cuda.is_available():
+            return func
+    return torch.compile(func)
+
+
 class InputPadder:
     """ Pads images such that dimensions are divisible by 8 """
     def __init__(self, dims, mode='sintel', divis_by=8, force_square=False):
@@ -32,7 +43,7 @@ class InputPadder:
         return x[..., c[0]:c[1], c[2]:c[3]]
 
 
-@torch.compile
+@_optional_torch_compile
 def bilinear_sampler1d(img, x_coords, mode='bilinear', align_corners=True):
     """
     1D bilinear sampling along width dimension only (for stereo applications)

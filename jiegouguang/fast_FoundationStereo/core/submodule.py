@@ -13,6 +13,14 @@ except Exception:
   triton = None
   tl = None
 
+
+def _optional_torch_compile(func):
+    if not hasattr(torch, 'compile'):
+        return func
+    if torch.cuda.is_available() and triton is None:
+        return func
+    return torch.compile(func)
+
 def _is_contiguous(tensor: torch.Tensor) -> bool:
     if torch.jit.is_scripting():
         return tensor.is_contiguous()
@@ -373,7 +381,7 @@ class Conv2x_IN(nn.Module):
 
 
 
-@torch.compile
+@_optional_torch_compile
 def build_gwc_volume_optimized_pytorch1(refimg_fea: torch.Tensor, targetimg_fea: torch.Tensor, maxdisp: int, num_groups: int, normalize=True):
   dtype = refimg_fea.dtype
   B, C, H, W = refimg_fea.shape
@@ -479,7 +487,7 @@ def build_gwc_volume_triton(refimg_fea: torch.Tensor, targetimg_fea: torch.Tenso
 
 
 
-@torch.compile
+@_optional_torch_compile
 def build_concat_volume_optimized_pytorch(refimg_fea, targetimg_fea, maxdisp:int):
   B, C, H, W = refimg_fea.shape
   ref_volume = refimg_fea.unsqueeze(2).expand(B, C, maxdisp, H, W)
@@ -489,7 +497,7 @@ def build_concat_volume_optimized_pytorch(refimg_fea, targetimg_fea, maxdisp:int
   return volume.contiguous()
 
 
-@torch.compile
+@_optional_torch_compile
 def build_concat_volume_optimized_pytorch1(refimg_fea, targetimg_fea, maxdisp:int):
     B, C, H, W = refimg_fea.shape
 

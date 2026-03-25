@@ -10,10 +10,10 @@ sys.path.append(os.path.dirname(__file__))
 
 # 下面都是自己实现的各种方法
 from manual_feature.ManualFeature import ManualFeatureJieGouGuang
-from LightGlue_feature.NeuralFeature import NeuralFeatureJieGouGuang
+# from LightGlue_feature.NeuralFeature import NeuralFeatureJieGouGuang
 from sgbm.sgbm import SGBM
-from FoundationStereo.stereo_inference import StereoInference
-from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
+# from FoundationStereo.stereo_inference import StereoInference
+# from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
 from fast_FoundationStereo.fast_stereo_inference import FastStereoInference
 from color import ColorMapper  # 颜色映射模块 - DX
 

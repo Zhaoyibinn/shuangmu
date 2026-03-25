@@ -11,3 +11,8 @@ v_{t}=\beta_{2} v_{t-1}+\left(1-\beta_{2}\right) \nabla J\left(\theta_{t}\right)
 \hat{m}_{t}=\frac{m_{t}}{1-\beta_{1}^{t}}, \quad \hat{v}_{t}=\frac{v_{t}}{1-\beta_{2}^{t}}\\
 \theta_{t+1}=\theta_{t}-\frac{\alpha}{\sqrt{\hat{v}_{t}}+\epsilon} \hat{m}_{t}
 \end{array}$$
+
+
+# mx显卡
+
+取消了半精度推理和torch.compile 装饰器

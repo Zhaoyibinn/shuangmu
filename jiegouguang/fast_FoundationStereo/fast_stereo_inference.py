@@ -14,7 +14,7 @@ from typing import Optional, Dict
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
-AMP_DTYPE = torch.float16
+AMP_DTYPE = torch.float32
 
 
 def _load_input_padder():
@@ -34,6 +34,14 @@ class FastStereoInference:
     """
 
     DEFAULT_MODEL_PATH = "jiegouguang/weights/fast_FoundationStereo/23-36-37/model_best_bp2_serialize.pth"
+
+    @staticmethod
+    def _configure_safe_precision(model):
+        model.args.mixed_precision = False
+        utils_mod = sys.modules.get('Utils')
+        if utils_mod is not None and hasattr(utils_mod, 'AMP_DTYPE'):
+            utils_mod.AMP_DTYPE = torch.float32
+        return model
 
     def __init__(self, ckpt_path: Optional[str] = None, valid_iters: int = 8, max_disp: int = 192):
         """
@@ -78,6 +86,7 @@ class FastStereoInference:
 
         model.args.valid_iters = valid_iters
         model.args.max_disp = max_disp
+        model = self._configure_safe_precision(model)
         model.cuda().eval()
         torch.autograd.set_grad_enabled(False)
 
@@ -124,7 +133,7 @@ class FastStereoInference:
         padder = _load_input_padder()(img0_t.shape, divis_by=32, force_square=False)
         img0_t, img1_t = padder.pad(img0_t, img1_t)
 
-        with torch.no_grad(), torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=False, dtype=AMP_DTYPE):
             disp = self.model.forward(img0_t, img1_t,
                                       iters=self.model.args.valid_iters,
                                       test_mode=True,
