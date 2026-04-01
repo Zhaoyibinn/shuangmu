@@ -83,7 +83,7 @@ for idx in tqdm(range(len(jiegouguang_class.img1_list))):
     # if idx >= 50:
     #     break
 
-    jiegouguang_class.import_biaodin('biaoding/extrinsics_2d415_20260331.yml','biaoding/intrinsics_2d415_20260331.yml',idx=idx)
+    jiegouguang_class.import_biaodin('biaoding/extrinsics_2d415_20260401.yml','biaoding/intrinsics_2d415_20260401.yml',idx=idx)
 
 
 

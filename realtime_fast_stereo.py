@@ -121,8 +121,8 @@ def save_current_frame(save_root, color, depth_map, K, max_depth=1500):
     print(f"[{timestamp}] 成功保存RGB、深度图和点云至: {save_dir}")
 
 def main():
-    extri_path = 'biaoding/extrinsics_2d415_20260331.yml'
-    intri_path = 'biaoding/intrinsics_2d415_20260331.yml'
+    extri_path = 'biaoding/extrinsics_2d415_20260401.yml'
+    intri_path = 'biaoding/intrinsics_2d415_20260401.yml'
     weight_path = "jiegouguang/weights/fast_FoundationStereo/23-36-37/model_best_bp2_serialize.pth"
     
     # 数据保存路径
@@ -132,7 +132,7 @@ def main():
 
     print("============ 初始化标定参数 ============")
     map1_x, map1_y, map2_x, map2_y, K_rect, baseline_m = load_calibration_and_get_maps(
-        extri_path, intri_path, shape=(640, 480)
+        extri_path, intri_path, shape=(1280, 720)
     )
     print("标定参数加载成功！基线长度: {:.4f}m".format(baseline_m))
     
@@ -155,8 +155,8 @@ def main():
     config1.enable_device(devices[0].get_info(rs.camera_info.serial_number))
     config2.enable_device(devices[1].get_info(rs.camera_info.serial_number))
 
-    config1.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    config2.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config1.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    config2.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
 
     pipeline1.start(config1)
     pipeline2.start(config2)

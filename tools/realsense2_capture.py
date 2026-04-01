@@ -24,8 +24,8 @@ else:
     config1.enable_device(devices[0].get_info(rs.camera_info.serial_number))
     config2.enable_device(devices[1].get_info(rs.camera_info.serial_number))
 
-    config1.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
-    config2.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+    config1.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+    config2.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
 
     # 启动管道
     pipeline1.start(config1)
