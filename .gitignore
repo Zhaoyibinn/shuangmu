@@ -17,3 +17,5 @@ depth_outputs
 huojian
 *.ts
 *.pt
+
+data/*

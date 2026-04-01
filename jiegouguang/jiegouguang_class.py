@@ -10,10 +10,10 @@ sys.path.append(os.path.dirname(__file__))
 
 # 下面都是自己实现的各种方法
 from manual_feature.ManualFeature import ManualFeatureJieGouGuang
-from LightGlue_feature.NeuralFeature import NeuralFeatureJieGouGuang
-from sgbm.sgbm import SGBM
+# from LightGlue_feature.NeuralFeature import NeuralFeatureJieGouGuang
+# from sgbm.sgbm import SGBM
 from FoundationStereo.stereo_inference import StereoInference
-from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
+# from bridgedepth.bridgedepth_stereo import BridgeDepthStereo
 from fast_FoundationStereo.fast_stereo_inference import FastStereoInference
 from color import ColorMapper  # 颜色映射模块 - DX
 
@@ -80,7 +80,7 @@ class JieGouGuang:
         self.img1_rectify_list = []
         self.img2_rectify_list = []
 
-        self.max_dis = 1500
+        self.max_dis = 4000
         self.min_dis = 100
         # 最近最远深度
 
@@ -186,7 +186,7 @@ class JieGouGuang:
             )
         elif self.method == 'fast_foundation_stereo':
             self.processor = FastStereoInference(
-                "jiegouguang/weights/fast_FoundationStereo/23-36-37/model_best_bp2_serialize.pth"
+                "jiegouguang/weights/fast_FoundationStereo/23-36-37/model_best_bp2_serialize.pth",max_disp=384
             )
         
 
@@ -213,7 +213,7 @@ class JieGouGuang:
     def foundation_stereo(self):
         
 
-        results = self.processor.infer(self.img1_rectify, self.img2_rectify, self.K1, abs(float(self.cam_t[0])))
+        results = self.processor.infer(self.img1_rectify, self.img2_rectify, self.K1, abs(float(self.cam_t[0][0])))
         # pcd_np = results['points_cam1'].astype(np.float64).reshape(-1, 3)
         # pcd = o3d.geometry.PointCloud()
         # pcd.points = o3d.utility.Vector3dVector(pcd_np)
@@ -224,7 +224,7 @@ class JieGouGuang:
     def fast_foundation_stereo(self):
         results = self.processor.infer(
             self.img1_rectify, self.img2_rectify,
-            self.K1, abs(float(self.cam_t[0]))
+            self.K1, abs(float(self.cam_t[0][0]))
         )
         return results['disparity']
 

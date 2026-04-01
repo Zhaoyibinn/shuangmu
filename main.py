@@ -9,20 +9,21 @@ import time
 from tqdm import tqdm
 
 
-from ultralytics.models.sam import SAM3DynamicInteractivePredictor
-from ultralytics.utils.plotting import Annotator, colors
+# from ultralytics.models.sam import SAM3DynamicInteractivePredictor
+# from ultralytics.utils.plotting import Annotator, colors
 
 
 
 
 
 
-data_root_path = "huojian/d455_huojian_ce"
+data_root_path = "realsense_capture"
 depth_dir = 'depth_outputs/test'
 
 sam = False
 
-jiegouguang_class = JieGouGuang(os.path.join(data_root_path, 'left'),os.path.join(data_root_path, 'right'),img_rgb_path=os.path.join(data_root_path, "color")) # 碎片
+# jiegouguang_class = JieGouGuang(os.path.join(data_root_path, 'left'),os.path.join(data_root_path, 'right'),img_rgb_path=os.path.join(data_root_path, "color")) # 碎片
+jiegouguang_class = JieGouGuang(os.path.join(data_root_path, 'left'),os.path.join(data_root_path, 'right')) # 碎片
 
 
 if sam:
@@ -82,7 +83,7 @@ for idx in tqdm(range(len(jiegouguang_class.img1_list))):
     # if idx >= 50:
     #     break
 
-    jiegouguang_class.import_biaodin('biaoding/extrinsics_d455_20250915.yml','biaoding/intrinsics_d455_20250915.yml',idx=idx)
+    jiegouguang_class.import_biaodin('biaoding/extrinsics_2d415_20260331.yml','biaoding/intrinsics_2d415_20260331.yml',idx=idx)
 
 
 
@@ -110,8 +111,8 @@ for idx in tqdm(range(len(jiegouguang_class.img1_list))):
         rgb = rgbd[:, :, :3].astype(np.uint8)
         depth = rgbd[:, :, 3].astype(np.uint16)
         gray_left_img = jiegouguang_class.img1_list[idx]
-        cv2.imwrite(os.path.join(depth_dir, 'depth', f'depth_{idx:04d}.png'), rgbd[:,:,3].astype(np.uint16))
-        cv2.imwrite(os.path.join(depth_dir, 'depth_vis', f'depth_vis_{idx:04d}.png'), (rgbd[:,:,3]/4).astype(np.uint8))
+        # cv2.imwrite(os.path.join(depth_dir, 'depth', f'depth_{idx:04d}.png'), rgbd[:,:,3].astype(np.uint16))
+        # cv2.imwrite(os.path.join(depth_dir, 'depth_vis', f'depth_vis_{idx:04d}.png'), (rgbd[:,:,3]/4).astype(np.uint8))
         # img_fusion = cv2.addWeighted(rgb,0.6,cv2.cvtColor(gray_left_img,cv2.COLOR_GRAY2BGR),0.4,0)
 
         # cv2.imwrite(os.path.join(depth_dir, f'img_fusion_{idx:04d}.png'), img_fusion)
@@ -126,7 +127,8 @@ for idx in tqdm(range(len(jiegouguang_class.img1_list))):
 
 
     depth_vis = np.clip(depth * 0.2, 0, 255).astype(np.uint8)
-    # cv2.imwrite(os.path.join(depth_dir, f'depth_{idx:03d}.png'), depth_vis)
+    cv2.imwrite(os.path.join(depth_dir, 'depth', f'depth_{idx:04d}.png'), depth.astype(np.uint16))
+    cv2.imwrite(os.path.join(depth_dir, 'depth_vis', f'depth_vis_{idx:04d}.png'), (depth_vis/2).astype(np.uint8))
     if jiegouguang_class.img_rgb_list is None:
         cv2.imwrite(os.path.join(depth_dir, 'depth', f'depth_{idx:04d}.png'), depth.astype(np.uint16))
     if video_writer is None:

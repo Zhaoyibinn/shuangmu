@@ -13,6 +13,14 @@
             "args": []
         },
         {
+            "name": "realtime_fast_stereo",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "realtime_fast_stereo.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
             "name": "reg",
             "type": "debugpy",
             "request": "launch",
