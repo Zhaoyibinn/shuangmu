@@ -21,6 +21,14 @@
             "args": []
         },
         {
+            "name": "aruco_pose",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/aruco_pose.py",
+            "console": "integratedTerminal",
+            "args": []
+        },
+        {
             "name": "reg",
             "type": "debugpy",
             "request": "launch",

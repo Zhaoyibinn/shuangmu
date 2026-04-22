@@ -95,10 +95,21 @@ class JieGouGuang:
 
         # 初始化颜色映射器 - DX
         self.color_mapper = ColorMapper()
+        self.color_yaml_path = None
+        self.rgb_camera_matrix = None
+        self.rgb_extrinsic_rotation = None
+        self.rgb_extrinsic_translation = None
 
-    def import_biaodin(self,extri_path,intri_path,idx = 0):
+    def import_biaodin(self,extri_path,intri_path,color_yaml_path=None,idx = 0):
         current_img1 = self.img1_list[idx]
         current_img2 = self.img2_list[idx]
+
+        if color_yaml_path is not None and self.color_yaml_path != color_yaml_path:
+            self.color_mapper.load_calibration(color_yaml_path)
+            # self.color_yaml_path = color_yaml_path
+            # self.rgb_camera_matrix = self.color_mapper.K_RGB.copy()
+            # self.rgb_extrinsic_rotation = self.color_mapper.R_L2RGB.copy()
+            # self.rgb_extrinsic_translation = self.color_mapper.t_L2RGB.copy()
         
 
         extri = cv2.FileStorage(extri_path, cv2.FILE_STORAGE_READ)
@@ -325,12 +336,13 @@ class JieGouGuang:
         print(f'Max abs distance: {abs_dist.max():.6f}')
 
 
-    def depth2pointcloud(self,depth):
+    def depth2pointcloud(self, depth, color_image=None):
         """
         将深度图转换为 Open3D 点云。深度值与 self.K1 对应的相机坐标系一致。
 
         Args:
             depth (np.ndarray): 单通道深度图，单位与外部流程保持一致。
+            color_image (np.ndarray | None): 与深度图对齐的彩色图像，优先用于点云着色。
 
         Returns:
             o3d.geometry.PointCloud: 生成的点云。
@@ -370,8 +382,10 @@ class JieGouGuang:
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(points)
 
-        # 使用对应像素灰度作为伪彩色，方便可视化
-        base_img = getattr(self, 'img1_rectify', getattr(self, 'img1', None))
+        # 优先使用外部传入的对齐 RGB 图像，否则退回到已有图像做伪彩色。
+        base_img = color_image
+        if base_img is None:
+            base_img = getattr(self, 'img1_rectify', getattr(self, 'img1', None))
         if base_img is not None and base_img.shape[:2] == depth.shape:
             if base_img.ndim == 2:
                 colors = base_img[valid_mask].astype(np.float64) / 255.0

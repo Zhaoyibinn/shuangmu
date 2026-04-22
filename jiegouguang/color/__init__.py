@@ -12,17 +12,24 @@ class ColorMapper:
     """RGB颜色映射器 - 将深度图染色为RGBD"""
 
     def __init__(self, yaml_path: str = None):
+        # self.yaml_path = None
+        # self.K_RGB = None
+        # self.R_L2RGB = None
+        # self.t_L2RGB = None
+
+        if yaml_path is not None:
+            self.load_calibration(yaml_path)
+
+    def load_calibration(self, yaml_path: str) -> None:
         """
-        初始化：加载RGB标定参数
+        加载RGB标定参数
 
         参数:
-            yaml_path: rgb_calib.yaml 路径，默认为同目录下的文件
+            yaml_path: rgb_calib.yaml 路径
         """
-        if yaml_path is None:
-            yaml_path = os.path.join(os.path.dirname(__file__), 'rgb_calib_zyb_20250121.yaml')
-
         with open(yaml_path, 'r') as f:
             cfg = yaml.safe_load(f)
+        self.yaml_path = yaml_path
 
         # RGB内参
         intr = cfg['rgb_intrinsics']
@@ -56,6 +63,9 @@ class ColorMapper:
                   - rgbd[:,:,0:3] = RGB颜色 (uint8)
                   - rgbd[:,:,3] = 深度值 (float32, 米)
         """
+        # if self.K_RGB is None or self.R_L2RGB is None or self.t_L2RGB is None:
+        #     raise ValueError('RGB calibration is not loaded, call load_calibration() first')
+
         H, W = depth_L.shape
         h_c, w_c = rgb_img.shape[:2]
         # 初始化RGBD（float32存储，方便D通道）
