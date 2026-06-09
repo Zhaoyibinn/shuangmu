@@ -1,0 +1,31 @@
+defaults: default.yaml
+
+paths:
+  data_root_path: huojian/d455_penguan_20260525/video
+  save_dir: depth_outputs/d455_penguan_20260525/video
+  ext_yaml_path: biaoding/extrinsics_d455_720p_20260526.yml
+  int_yaml_path: biaoding/intrinsics_d455_720p_20260526.yml
+  color_ext_yaml_path: biaoding/rgb_calib_d455_720p_20260526.yaml
+  aruco_board_yaml_path: config/aruco_boards.yaml
+
+reconstruction:
+  world_voxel_size_mm: 1.0
+  aruco_length: 24.0
+  stereo_method: foundation_stereo
+  use_aruco: true
+  brightness_mask:
+    enabled: true
+    threshold: 40
+
+segmentation:
+  enabled: true
+  method: yolo
+  yolo_model_path: huojian/d455_penguan_20260525/video/exp-2.pt
+  yolo_device: null
+
+global_registration:
+  method: pose_graph
+  # method: ejrgf
+
+runtime:
+  frame_stride: 1

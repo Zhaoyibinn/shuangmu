@@ -2,8 +2,8 @@ import cv2
 import os
  
 img_list = []
-input_path = r"whx_biaoding/R/"  # 要处理的图片所在的文件夹
-output_path = r"whx_biaoding/gray/R/"  # 处理完的图片放在这里
+input_path = "/home/zhaoyibin/下载/left"  # 要处理的图片所在的文件夹
+output_path = "/home/zhaoyibin/下载/left_gray/"  # 处理完的图片放在这里
 for item in os.listdir(input_path):
     img_list.append(os.path.join(input_path, item))
 print(list)

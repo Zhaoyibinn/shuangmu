@@ -29,10 +29,10 @@
             "args": []
         },
         {
-            "name": "reg",
+            "name": "JRMPC",
             "type": "debugpy",
             "request": "launch",
-            "program": "reg.py",
+            "program": "JRMPC_python/JRMPC.py",
             "console": "integratedTerminal",
             "args": []
         },

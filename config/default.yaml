@@ -1,0 +1,58 @@
+paths:
+  data_root_path: null
+  save_dir: depth_outputs/output
+  ext_yaml_path: null
+  int_yaml_path: null
+  color_ext_yaml_path: null
+  aruco_board_yaml_path: config/aruco_boards.yaml
+
+reconstruction:
+  world_voxel_size_mm: 1.0
+  aruco_length: 148.0
+  stereo_method: fast_foundation_stereo
+  use_aruco: false
+  brightness_mask:
+    enabled: false
+    threshold: 20
+
+segmentation:
+  enabled: false
+  method: sam
+  sam_model_path: sam3.pt
+  yolo_model_path: null
+  yolo_conf: 0.25
+  yolo_imgsz: 1280
+  yolo_device: null
+  statistical_nb_neighbors: 20
+  statistical_std_ratio: 2.0
+
+global_registration:
+  enabled: true
+  method: pose_graph
+  pose_graph:
+    voxel_size_mm: 1.0
+    final_voxel_size_mm: 1.0
+    max_correspondence_distance_mm: 10.0
+    max_iteration: 500
+    loop_closure_stride: 30
+    preference_loop_closure: 0.1
+    edge_prune_threshold: 0.25
+    reference_node: 0
+  ejrgf:
+    registration_voxel_size_mm: 1.0
+    final_voxel_size_mm: 1.0
+    max_registration_points: 30000
+    subgroup_size: 10
+    gmm_mean_local_num: 500
+    epsilon: 1.0e-6
+    local_sigma: 0.0
+    local_iteration_num: 200
+    global_refinement: false
+    gmm_mean_global_num: 1000
+    global_sigma: 0.0
+    global_iteration_num: 100
+    seed: 0
+    merge_downsample_every: 0
+
+runtime:
+  frame_stride: 1

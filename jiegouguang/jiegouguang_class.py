@@ -80,7 +80,7 @@ class JieGouGuang:
         self.img1_rectify_list = []
         self.img2_rectify_list = []
 
-        self.max_dis = 4000
+        self.max_dis = 10000
         self.min_dis = 100
         # 最近最远深度
 
