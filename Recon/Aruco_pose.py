@@ -4,6 +4,8 @@ import numpy as np
 import open3d as o3d
 import yaml
 
+from Recon.config_loader import load_config
+
 
 class Aruco_pose_Estimater(object):
     BOARD_MARKER_PITCH_RATIO = 32.0 / 24.0
@@ -79,8 +81,7 @@ class Aruco_pose_Estimater(object):
 
     @classmethod
     def load_board_config(cls, board_yaml_path):
-        with open(board_yaml_path, 'r', encoding='utf-8') as file:
-            board_config = yaml.safe_load(file)
+        board_config = load_config(board_yaml_path)
 
         aruco_length = None
         if 'aruco_length' in board_config:

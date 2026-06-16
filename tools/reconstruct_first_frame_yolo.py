@@ -39,7 +39,7 @@ def parse_args():
             "voxel-downsample it, and move its centroid to the origin."
         )
     )
-    parser.add_argument("--config", default="config/main.yaml")
+    parser.add_argument("--config", default="config/pose/main.yaml")
     parser.add_argument("--input-root", default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--output-path", default=DEFAULT_OUTPUT_PATH)
     parser.add_argument("--icp-target-path", default=DEFAULT_ICP_TARGET_PATH)

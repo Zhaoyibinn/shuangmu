@@ -1,4 +1,4 @@
-# 记录了板子上的aruco marker的id和位置关系，中心和边长
+# ArUco board marker IDs and marker-center positions in millimeters.
 aruco_length: 24.0
 boards:
   0:

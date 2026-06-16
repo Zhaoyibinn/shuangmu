@@ -4,7 +4,7 @@ paths:
   ext_yaml_path: null
   int_yaml_path: null
   color_ext_yaml_path: null
-  aruco_board_yaml_path: config/aruco_boards.yaml
+  aruco_board_yaml_path: config/aruco_board/main.yaml
 
 reconstruction:
   world_voxel_size_mm: 1.0

@@ -6,7 +6,7 @@ paths:
   ext_yaml_path: biaoding/extrinsics_d455_720p_20260526.yml
   int_yaml_path: biaoding/intrinsics_d455_720p_20260526.yml
   color_ext_yaml_path: biaoding/rgb_calib_d455_720p_20260526.yaml
-  aruco_board_yaml_path: config/aruco_boards.yaml
+  aruco_board_yaml_path: config/aruco_board/main.yaml
 
 reconstruction:
   world_voxel_size_mm: 1.0
@@ -25,7 +25,6 @@ segmentation:
 
 global_registration:
   method: pose_graph
-  # method: ejrgf
 
 runtime:
   frame_stride: 1

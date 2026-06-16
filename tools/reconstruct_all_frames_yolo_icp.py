@@ -47,7 +47,7 @@ def parse_args():
             "rigid no-scale ICP, and print six-DoF poses in real time."
         )
     )
-    parser.add_argument("--config", default="config/main.yaml")
+    parser.add_argument("--config", default="config/pose/main.yaml")
     parser.add_argument("--input-root", default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--icp-target-path", default=DEFAULT_ICP_TARGET_PATH)

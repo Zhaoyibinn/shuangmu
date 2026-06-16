@@ -42,11 +42,25 @@ def _deep_merge(defaults, overrides):
 def load_config(config_path):
     config_path = Path(config_path).resolve()
     overrides = _read_yaml(config_path)
-    default_name = overrides.pop('defaults', 'default.yaml')
-    default_path = Path(default_name)
-    if not default_path.is_absolute():
-        default_path = config_path.parent / default_path
+    default_name = overrides.pop('defaults', None)
+    if config_path.name == 'default.yaml':
+        if default_name is not None:
+            raise ValueError('default.yaml cannot inherit another config')
+        return overrides
+
+    if default_name is None:
+        default_name = 'default.yaml'
+    default_path = (config_path.parent / default_name).resolve()
+    expected_default_path = (config_path.parent / 'default.yaml').resolve()
+    if default_path != expected_default_path:
+        raise ValueError(
+            'configuration {} may only inherit sibling default.yaml'.format(
+                config_path
+            )
+        )
 
     defaults = _read_yaml(default_path)
+    if 'defaults' in defaults:
+        raise ValueError('default.yaml cannot inherit another config')
     _validate_override_keys(defaults, overrides)
     return _deep_merge(defaults, overrides)

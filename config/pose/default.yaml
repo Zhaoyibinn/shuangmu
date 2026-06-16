@@ -1,0 +1,49 @@
+paths:
+  input_root: null
+  output_root: depth_outputs/pose
+  icp_target_path: null
+  stereo_model_path: null
+  ext_yaml_path: null
+  int_yaml_path: null
+  color_ext_yaml_path: null
+
+stereo:
+  device: null
+  valid_iters: 32
+
+reconstruction:
+  brightness_mask:
+    enabled: false
+    threshold: 20
+
+point_cloud:
+  voxel_size_mm: 1.0
+  min_depth_mm: 100.0
+  max_depth_mm: 1000.0
+
+segmentation:
+  yolo_model_path: null
+  yolo_conf: 0.25
+  yolo_imgsz: 1280
+  yolo_device: null
+  statistical_nb_neighbors: 20
+  statistical_std_ratio: 2.0
+
+icp:
+  coarse_voxel_size_mm: 3.0
+  coarse_max_correspondence_mm: 30.0
+  coarse_iterations: 60
+  fine_voxel_size_mm: 1.0
+  fine_max_correspondence_mm: 10.0
+  fine_iterations: 100
+  fallback_fitness: 0.85
+
+runtime:
+  start_frame: 0
+  end_frame: null
+  keyframe_interval: 1
+  continue_on_error: false
+  profile_stages: false
+
+output:
+  write_ascii: false

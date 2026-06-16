@@ -10,8 +10,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Stereo point-cloud reconstruction')
     parser.add_argument(
         '--config',
-        default='config/main.yaml',
-        help='Experiment YAML. Its defaults field selects the default YAML.',
+        default='config/recon/main.yaml',
+        help='Reconstruction YAML; it may only inherit config/recon/default.yaml.',
     )
     return parser.parse_args()
 
