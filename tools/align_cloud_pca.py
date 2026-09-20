@@ -7,8 +7,7 @@ import open3d as o3d
 
 
 DEFAULT_INPUT_PATH = (
-    "depth_outputs/d455_penguan_20260525/video/aruco_fusion/"
-    "pose_graph_registration/merged_cloud_pose_graph_sam_cut.ply"
+    "depth_outputs/d455_penguan_20260525/video_shu/aruco_fusion/pose_graph_registration/merged_cloud_pose_graph_sam.ply"
 )
 
 

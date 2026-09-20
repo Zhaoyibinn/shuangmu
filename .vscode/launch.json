@@ -10,6 +10,16 @@
             "request": "launch",
             "program": "main.py",
             "console": "integratedTerminal",
+            "args": [
+                "--config","config/recon/main.yaml"
+            ]
+        },
+        {
+            "name": "main_pose",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "main_pose.py",
+            "console": "integratedTerminal",
             "args": []
         },
         {

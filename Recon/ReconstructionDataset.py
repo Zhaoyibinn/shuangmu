@@ -12,11 +12,15 @@ class ReconstructionDataset(Dataset):
         ext_yaml_path,
         int_yaml_path,
         color_ext_yaml_path=None,
+        min_depth_mm=100,
+        max_depth_mm=4000,
     ):
         self.data_root_path = data_root_path
         self.ext_yaml_path = ext_yaml_path
         self.int_yaml_path = int_yaml_path
         self.color_ext_yaml_path = color_ext_yaml_path
+        self.min_depth_mm = float(min_depth_mm)
+        self.max_depth_mm = float(max_depth_mm)
 
         self.left_images = self._load_media_sequence(os.path.join(data_root_path, 'left'))
         self.right_images = self._load_media_sequence(os.path.join(data_root_path, 'right'))
@@ -110,8 +114,8 @@ class ReconstructionDataset(Dataset):
 
             focal_length = float(new_M1[0, 0])
             baseline = abs(float(t[0][0]))
-            min_dis = 100
-            max_dis = 4000
+            min_dis = self.min_depth_mm
+            max_dis = self.max_depth_mm
 
             return {
                 'left_rectified': left_rectified,

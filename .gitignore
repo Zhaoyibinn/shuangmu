@@ -19,3 +19,4 @@ huojian
 *.pt
 
 data/*
+yolo_train/*

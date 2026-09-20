@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import sys
 from pathlib import Path
 
@@ -88,6 +89,7 @@ class Reconstruction(object):
         data_root_path=None,
         aruco_board_yaml_path=None,
         use_sam=None,
+        initialize_processing=True,
     ):
         self.color_ext_yaml_path = color_ext_yaml_path
         self.aruco_length = float(aruco_length)
@@ -118,19 +120,23 @@ class Reconstruction(object):
         self.data_root_path = data_root_path
         logging.getLogger('ultralytics').setLevel(logging.ERROR)
 
-        if self.data_root_path is None:
+        if initialize_processing and self.data_root_path is None:
             raise ValueError('Reconstruction requires data_root_path')
 
-        rgb_path = os.path.join(self.data_root_path, 'color')
-        self.jiegouguang = JieGouGuang(
-            os.path.join(self.data_root_path, 'left'),
-            os.path.join(self.data_root_path, 'right'),
-            img_rgb_path=rgb_path if os.path.exists(rgb_path) else None,
-        )
-        self.jiegouguang.method = self.method
-        self.jiegouguang.init_model()
-        if self.color_ext_yaml_path is not None:
-            self.jiegouguang.color_mapper.load_calibration(self.color_ext_yaml_path)
+        self.jiegouguang = None
+        if initialize_processing:
+            rgb_path = os.path.join(self.data_root_path, 'color')
+            self.jiegouguang = JieGouGuang(
+                os.path.join(self.data_root_path, 'left'),
+                os.path.join(self.data_root_path, 'right'),
+                img_rgb_path=rgb_path if os.path.exists(rgb_path) else None,
+            )
+            self.jiegouguang.method = self.method
+            self.jiegouguang.init_model()
+            if self.color_ext_yaml_path is not None:
+                self.jiegouguang.color_mapper.load_calibration(
+                    self.color_ext_yaml_path
+                )
 
         self.predictor = None
         self.yolo_model = None
@@ -168,11 +174,11 @@ class Reconstruction(object):
         self.video_path = None
         self.rgb_video_path = None
 
-        if self.use_sam:
+        if initialize_processing and self.use_sam:
             self.init_sam()
-        if self.use_yolo:
+        if initialize_processing and self.use_yolo:
             self.init_yolo()
-        if use_aruco:
+        if initialize_processing and use_aruco:
             self.init_aruco()
 
     @staticmethod
@@ -219,6 +225,194 @@ class Reconstruction(object):
             transform[:3, :3] = np.asarray(frame_pose['rotation_cam_to_obj'], dtype=np.float64)
             transform[:3, 3] = np.asarray(frame_pose['translation_cam_to_obj'], dtype=np.float64).reshape(3)
         return transform
+
+    @staticmethod
+    def quaternion_to_rotation_matrix(quaternion):
+        qw, qx, qy, qz = np.asarray(
+            quaternion,
+            dtype=np.float64,
+        ).reshape(4)
+        norm = np.linalg.norm([qw, qx, qy, qz])
+        assert norm > 0.0, 'camera pose contains a zero quaternion'
+        qw, qx, qy, qz = np.array([qw, qx, qy, qz]) / norm
+        return np.array([
+            [
+                1.0 - 2.0 * (qy * qy + qz * qz),
+                2.0 * (qx * qy - qz * qw),
+                2.0 * (qx * qz + qy * qw),
+            ],
+            [
+                2.0 * (qx * qy + qz * qw),
+                1.0 - 2.0 * (qx * qx + qz * qz),
+                2.0 * (qy * qz - qx * qw),
+            ],
+            [
+                2.0 * (qx * qz - qy * qw),
+                2.0 * (qy * qz + qx * qw),
+                1.0 - 2.0 * (qx * qx + qy * qy),
+            ],
+        ], dtype=np.float64)
+
+    @classmethod
+    def pose_record_to_transform(cls, pose_record):
+        world_to_camera = np.eye(4, dtype=np.float64)
+        world_to_camera[:3, :3] = cls.quaternion_to_rotation_matrix(
+            pose_record['rotation']
+        )
+        world_to_camera[:3, 3] = np.asarray(
+            pose_record['translation'],
+            dtype=np.float64,
+        ).reshape(3)
+        return np.linalg.inv(world_to_camera)
+
+    @staticmethod
+    def indexed_cloud_paths(directory, prefix):
+        directory = Path(directory)
+        if not directory.is_dir():
+            return {}
+
+        pattern = re.compile(
+            r'^{}_(\d+)\.ply$'.format(re.escape(prefix))
+        )
+        indexed_paths = {}
+        for cloud_path in directory.glob('*.ply'):
+            match = pattern.match(cloud_path.name)
+            if match is not None:
+                indexed_paths[int(match.group(1))] = str(cloud_path)
+        return indexed_paths
+
+    def load_global_registration_inputs(self, method, use_sem=False):
+        method = str(method).lower()
+        assert self.use_aruco, (
+            'reconstruction.use_aruco must be true for global registration'
+        )
+
+        world_clouds = self.indexed_cloud_paths(
+            self.cloud_world_dir,
+            'cloud_world',
+        )
+        assert len(world_clouds) >= 2, (
+            'global registration needs at least two world point clouds in '
+            '{}; found {}'.format(self.cloud_world_dir, len(world_clouds))
+        )
+        frame_indices = sorted(world_clouds)
+
+        if method == 'pose_graph':
+            assert os.path.isfile(self.pose_yaml_path), (
+                'missing camera pose file: {}'.format(self.pose_yaml_path)
+            )
+            with open(self.pose_yaml_path, 'r', encoding='utf-8') as pose_file:
+                pose_data = yaml.safe_load(pose_file) or {}
+            pose_records = pose_data.get('camera_poses', [])
+            assert len(pose_records) == len(frame_indices), (
+                'camera pose count ({}) does not match world point-cloud '
+                'count ({}) in {}'.format(
+                    len(pose_records),
+                    len(frame_indices),
+                    self.cloud_world_dir,
+                )
+            )
+
+            cloud_dir = (
+                self.output_dirs['cloud_sam']
+                if use_sem
+                else self.output_dirs['cloud']
+            )
+            cloud_prefix = 'cloud_sam' if use_sem else 'cloud'
+            registration_clouds = self.indexed_cloud_paths(
+                cloud_dir,
+                cloud_prefix,
+            )
+            missing_paths = [
+                os.path.join(
+                    cloud_dir,
+                    '{}_{:04d}.ply'.format(cloud_prefix, frame_idx),
+                )
+                for frame_idx in frame_indices
+                if frame_idx not in registration_clouds
+            ]
+            assert not missing_paths, (
+                'missing point clouds required by pose_graph:\n{}'.format(
+                    '\n'.join(missing_paths)
+                )
+            )
+
+            self.pose_graph_entries = [
+                {
+                    'idx': frame_idx,
+                    'cloud_path': (
+                        registration_clouds[frame_idx]
+                        if not use_sem
+                        else None
+                    ),
+                    'cloud_sam_path': (
+                        registration_clouds[frame_idx]
+                        if use_sem
+                        else None
+                    ),
+                    'cloud_world_path': world_clouds[frame_idx],
+                    'cloud_world_sam_path': None,
+                    'initial_pose': self.pose_record_to_transform(pose_record),
+                }
+                for frame_idx, pose_record in zip(
+                    frame_indices,
+                    pose_records,
+                )
+            ]
+        elif method == 'ejrgf':
+            registration_clouds = world_clouds
+            if use_sem:
+                registration_clouds = self.indexed_cloud_paths(
+                    self.cloud_world_sam_dir,
+                    'cloud_world_sam',
+                )
+                missing_paths = [
+                    os.path.join(
+                        self.cloud_world_sam_dir,
+                        'cloud_world_sam_{:04d}.ply'.format(frame_idx),
+                    )
+                    for frame_idx in frame_indices
+                    if frame_idx not in registration_clouds
+                ]
+                assert not missing_paths, (
+                    'missing point clouds required by EJRGF:\n{}'.format(
+                        '\n'.join(missing_paths)
+                    )
+                )
+
+            self.pose_graph_entries = [
+                {
+                    'idx': frame_idx,
+                    'cloud_path': None,
+                    'cloud_sam_path': None,
+                    'cloud_world_path': (
+                        registration_clouds[frame_idx]
+                        if not use_sem
+                        else None
+                    ),
+                    'cloud_world_sam_path': (
+                        registration_clouds[frame_idx]
+                        if use_sem
+                        else None
+                    ),
+                    'initial_pose': np.eye(4, dtype=np.float64),
+                }
+                for frame_idx in frame_indices
+            ]
+        else:
+            raise ValueError(
+                'unsupported global registration method: {}'.format(method)
+            )
+
+        assert len(self.pose_graph_entries) >= 2, (
+            'global registration needs at least two complete input entries'
+        )
+        print(
+            'Loaded {} existing frames for {} global registration.'.format(
+                len(self.pose_graph_entries),
+                method,
+            )
+        )
 
     @staticmethod
     def find_matching_image(image_dir, stem):
@@ -508,11 +702,13 @@ class Reconstruction(object):
 
         rgb = None
         aruco_est_frame = sample['gray_left']
+        point_cloud_camera_matrix = camera_params['K1']
         if sample['rgb'] is not None:
             rgbd = self.jiegouguang.get_rgbd(depth_L=depth, rgb_img=sample['rgb'])
             rgb = rgbd[:, :, :3].astype(np.uint8)
             depth = rgbd[:, :, 3].astype(np.uint16)
             aruco_est_frame = rgb
+            point_cloud_camera_matrix = self.jiegouguang.color_mapper.K_RGB
         # 如果有RGB就执行反投影
 
         frame_pose = None
@@ -539,7 +735,11 @@ class Reconstruction(object):
             }
         # 如果有语义分割就识别目标并且分割
 
-        pcd = self.jiegouguang.depth2pointcloud(depth, color_image=rgb)
+        pcd = self.jiegouguang.depth2pointcloud(
+            depth,
+            color_image=rgb,
+            camera_matrix=point_cloud_camera_matrix,
+        )
         if len(pcd.colors) == 0:
             pcd.colors = o3d.utility.Vector3dVector(np.repeat([[1.0, 0.0, 0.0]], len(pcd.points), axis=0))
         # 生成点云
@@ -552,7 +752,11 @@ class Reconstruction(object):
         pcd_sam = None
         pcd_sam_world = None
         if sam_results is not None:
-            pcd_sam = self.jiegouguang.depth2pointcloud(sam_results['depth_sam'], color_image=sam_results['rgb_sam'])
+            pcd_sam = self.jiegouguang.depth2pointcloud(
+                sam_results['depth_sam'],
+                color_image=sam_results['rgb_sam'],
+                camera_matrix=point_cloud_camera_matrix,
+            )
             if len(pcd_sam.colors) == 0:
                 pcd_sam.colors = o3d.utility.Vector3dVector(np.repeat([[0.0, 1.0, 0.0]], len(pcd_sam.points), axis=0))
             pcd_sam = self.filter_semantic_point_cloud(pcd_sam)

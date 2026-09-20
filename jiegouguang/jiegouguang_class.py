@@ -336,13 +336,15 @@ class JieGouGuang:
         print(f'Max abs distance: {abs_dist.max():.6f}')
 
 
-    def depth2pointcloud(self, depth, color_image=None):
+    def depth2pointcloud(self, depth, color_image=None, camera_matrix=None):
         """
-        将深度图转换为 Open3D 点云。深度值与 self.K1 对应的相机坐标系一致。
+        将深度图转换为 Open3D 点云。深度值应与 camera_matrix 对应的相机
+        坐标系一致；未显式传入时使用左目内参 self.K1。
 
         Args:
             depth (np.ndarray): 单通道深度图，单位与外部流程保持一致。
             color_image (np.ndarray | None): 与深度图对齐的彩色图像，优先用于点云着色。
+            camera_matrix (np.ndarray | None): 深度图所在相机的 3x3 内参。
 
         Returns:
             o3d.geometry.PointCloud: 生成的点云。
@@ -355,10 +357,16 @@ class JieGouGuang:
         if depth.ndim != 2:
             raise ValueError('depth must be a single-channel image')
 
-        fx = float(self.K1[0, 0])
-        fy = float(self.K1[1, 1])
-        cx = float(self.K1[0, 2])
-        cy = float(self.K1[1, 2])
+        if camera_matrix is None:
+            camera_matrix = self.K1
+        camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+        if camera_matrix.shape != (3, 3):
+            raise ValueError('camera_matrix must have shape (3, 3)')
+
+        fx = float(camera_matrix[0, 0])
+        fy = float(camera_matrix[1, 1])
+        cx = float(camera_matrix[0, 2])
+        cy = float(camera_matrix[1, 2])
         if fx == 0 or fy == 0:
             raise ValueError('invalid camera intrinsics: focal length cannot be zero')
 

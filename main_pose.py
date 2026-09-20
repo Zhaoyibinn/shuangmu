@@ -52,18 +52,11 @@ def validate_config(config, frame_count=None):
         "segmentation.statistical_std_ratio": (
             config["segmentation"]["statistical_std_ratio"]
         ),
-        "icp.coarse_voxel_size_mm": config["icp"][
-            "coarse_voxel_size_mm"
+        "icp.voxel_size_mm": config["icp"]["voxel_size_mm"],
+        "icp.max_correspondence_mm": config["icp"][
+            "max_correspondence_mm"
         ],
-        "icp.coarse_max_correspondence_mm": config["icp"][
-            "coarse_max_correspondence_mm"
-        ],
-        "icp.coarse_iterations": config["icp"]["coarse_iterations"],
-        "icp.fine_voxel_size_mm": config["icp"]["fine_voxel_size_mm"],
-        "icp.fine_max_correspondence_mm": config["icp"][
-            "fine_max_correspondence_mm"
-        ],
-        "icp.fine_iterations": config["icp"]["fine_iterations"],
+        "icp.iterations": config["icp"]["iterations"],
     }
     for name, value in positive_values.items():
         if float(value) <= 0:
@@ -263,6 +256,7 @@ def open_pose_csv(csv_path: Path):
         "rotation_axis_x",
         "rotation_axis_y",
         "rotation_axis_z",
+        "removed_x_rotation_deg",
         "relative_pose_reference_frame_index",
         "relative_pose_reference_frame_name",
         "fitness",
@@ -283,6 +277,30 @@ def pose_components(transform):
     rotation = transform[:3, :3]
     translation = transform[:3, 3]
     return translation, matrix_to_rpy_degrees(rotation)
+
+
+def rpy_degrees_to_matrix(rpy_degrees):
+    roll, pitch, yaw = np.radians(rpy_degrees)
+    cr, sr = np.cos(roll), np.sin(roll)
+    cp, sp = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array(
+        [
+            [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+            [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+            [-sp, cp * sr, cp * cr],
+        ],
+        dtype=np.float64,
+    )
+
+
+def remove_x_axis_rotation(transform):
+    adjusted = transform.copy()
+    rpy_degrees = matrix_to_rpy_degrees(adjusted[:3, :3])
+    removed_roll_degrees = float(rpy_degrees[0])
+    rpy_degrees[0] = 0.0
+    adjusted[:3, :3] = rpy_degrees_to_matrix(rpy_degrees)
+    return adjusted, removed_roll_degrees
 
 
 def format_optional_float(value):
@@ -331,6 +349,7 @@ def save_rotation_angle_csv(records, csv_path):
         "rotation_center_x_mm",
         "rotation_center_y_mm",
         "rotation_center_z_mm",
+        "removed_x_rotation_deg",
     ]
     with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -351,6 +370,9 @@ def save_rotation_angle_csv(records, csv_path):
                     ),
                     "rotation_center_z_mm": (
                         record["rotation_center_z_mm"]
+                    ),
+                    "removed_x_rotation_deg": (
+                        record["removed_x_rotation_deg"]
                     ),
                 }
             )
@@ -449,6 +471,9 @@ def save_estimate(
             "relative_to_first_roll_deg": float(relative_rpy[0]),
             "relative_to_first_pitch_deg": float(relative_rpy[1]),
             "relative_to_first_yaw_deg": float(relative_rpy[2]),
+            "removed_x_rotation_deg": float(
+                rotation_analysis["removed_x_rotation_deg"]
+            ),
             "transform_original_source_to_first": (
                 relative_to_first.tolist()
             ),
@@ -548,8 +573,14 @@ def main():
                 relative_to_first = (
                     first_pose_inv @ estimate.original_to_target
                 )
+                relative_to_first, removed_x_rotation_degrees = (
+                    remove_x_axis_rotation(relative_to_first)
+                )
                 rotation_analysis = rotation_point_estimator.add(
                     relative_to_first
+                )
+                rotation_analysis["removed_x_rotation_deg"] = (
+                    removed_x_rotation_degrees
                 )
 
                 record = save_estimate(
@@ -639,14 +670,17 @@ def main():
                         "rotation_axis_z": (
                             rotation_analysis["rotation_axis_z"]
                         ),
+                        "removed_x_rotation_deg": (
+                            rotation_analysis["removed_x_rotation_deg"]
+                        ),
                         "relative_pose_reference_frame_index": (
                             relative_reference["frame_index"]
                         ),
                         "relative_pose_reference_frame_name": (
                             relative_reference["frame_name"]
                         ),
-                        "fitness": estimate.fine_fitness,
-                        "rmse_mm": estimate.fine_rmse_mm,
+                        "fitness": estimate.icp_fitness,
+                        "rmse_mm": estimate.icp_rmse_mm,
                         "initialization": estimate.initialization,
                         "point_count": estimate.point_count,
                         "elapsed_seconds": estimate.elapsed_seconds,
@@ -763,7 +797,9 @@ def main():
         "relative_pose_convention": (
             "transform_original_source_to_first = "
             "inverse(first transform_original_source_to_target) @ "
-            "current transform_original_source_to_target"
+            "current transform_original_source_to_target, then x-axis "
+            "rotation/roll is removed before saving relative pose and "
+            "estimating rotation angle/center"
         ),
         "translation_unit": "mm",
         "rotation_unit": "degree",

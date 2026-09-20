@@ -13,12 +13,27 @@ def parse_args():
         default='config/recon/main.yaml',
         help='Reconstruction YAML; it may only inherit config/recon/default.yaml.',
     )
+    parser.add_argument(
+        '--global-registration-only',
+        action='store_true',
+        help=(
+            'Override global_registration.only and run only global '
+            'registration from point clouds already saved under paths.save_dir.'
+        ),
+    )
     return parser.parse_args()
 
 
-def validate_config(config):
+def validate_config(config, global_registration_only=False):
     paths = config['paths']
-    for key in ['data_root_path', 'ext_yaml_path', 'int_yaml_path']:
+    required_path_keys = ['save_dir']
+    if not global_registration_only:
+        required_path_keys.extend([
+            'data_root_path',
+            'ext_yaml_path',
+            'int_yaml_path',
+        ])
+    for key in required_path_keys:
         if not paths[key]:
             raise ValueError('paths.{} must be configured'.format(key))
 
@@ -26,7 +41,8 @@ def validate_config(config):
     if segmentation['method'] not in {'sam', 'yolo'}:
         raise ValueError("segmentation.method must be 'sam' or 'yolo'")
     if (
-        segmentation['enabled']
+        not global_registration_only
+        and segmentation['enabled']
         and segmentation['method'] == 'yolo'
         and not segmentation['yolo_model_path']
     ):
@@ -47,6 +63,18 @@ def validate_config(config):
             'reconstruction.brightness_mask.threshold must be between 0 and 255'
         )
 
+    depth_range = config['reconstruction']['depth_range_mm']
+    min_depth_mm = float(depth_range['min'])
+    max_depth_mm = float(depth_range['max'])
+    if min_depth_mm <= 0:
+        raise ValueError(
+            'reconstruction.depth_range_mm.min must be greater than zero'
+        )
+    if max_depth_mm <= min_depth_mm:
+        raise ValueError(
+            'reconstruction.depth_range_mm.max must be greater than min'
+        )
+
     if int(config['runtime']['frame_stride']) <= 0:
         raise ValueError('runtime.frame_stride must be greater than zero')
 
@@ -54,20 +82,20 @@ def validate_config(config):
 def main():
     args = parse_args()
     config = load_config(args.config)
-    validate_config(config)
+    global_registration_only = (
+        args.global_registration_only
+        or bool(config['global_registration']['only'])
+    )
+    validate_config(
+        config,
+        global_registration_only=global_registration_only,
+    )
 
     paths = config['paths']
     reconstruction_config = config['reconstruction']
     segmentation_config = config['segmentation']
     registration_config = config['global_registration']
     runtime_config = config['runtime']
-
-    dataset = ReconstructionDataset(
-        data_root_path=paths['data_root_path'],
-        ext_yaml_path=paths['ext_yaml_path'],
-        int_yaml_path=paths['int_yaml_path'],
-        color_ext_yaml_path=paths['color_ext_yaml_path'],
-    )
 
     reconstruction = Reconstruction(
         data_root_path=paths['data_root_path'],
@@ -92,8 +120,35 @@ def main():
         sem_statistical_std_ratio=segmentation_config[
             'statistical_std_ratio'
         ],
+        initialize_processing=not global_registration_only,
     )
     reconstruction.prepare_outputs(save_dir=paths['save_dir'])
+
+    if global_registration_only:
+        assert registration_config['enabled'], (
+            'global_registration.enabled must be true when '
+            'global_registration.only is enabled'
+        )
+        registration_method = registration_config['method']
+        reconstruction.load_global_registration_inputs(
+            method=registration_method,
+            use_sem=segmentation_config['enabled'],
+        )
+        reconstruction.run_global_registration(
+            method=registration_method,
+            use_sem=segmentation_config['enabled'],
+            **registration_config[registration_method],
+        )
+        return
+
+    dataset = ReconstructionDataset(
+        data_root_path=paths['data_root_path'],
+        ext_yaml_path=paths['ext_yaml_path'],
+        int_yaml_path=paths['int_yaml_path'],
+        color_ext_yaml_path=paths['color_ext_yaml_path'],
+        min_depth_mm=reconstruction_config['depth_range_mm']['min'],
+        max_depth_mm=reconstruction_config['depth_range_mm']['max'],
+    )
 
     for sample in tqdm(dataset, total=len(dataset)):
         if sample['idx'] % int(runtime_config['frame_stride']) != 0:

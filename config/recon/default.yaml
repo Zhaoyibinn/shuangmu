@@ -11,6 +11,9 @@ reconstruction:
   aruco_length: 148.0
   stereo_method: fast_foundation_stereo
   use_aruco: false
+  depth_range_mm:
+    min: 100
+    max: 4000
   brightness_mask:
     enabled: false
     threshold: 20
@@ -28,6 +31,7 @@ segmentation:
 
 global_registration:
   enabled: true
+  only: false
   method: pose_graph
   pose_graph:
     voxel_size_mm: 1.0

@@ -9,6 +9,8 @@ from Recon.config_loader import load_config
 
 class Aruco_pose_Estimater(object):
     BOARD_MARKER_PITCH_RATIO = 32.0 / 24.0
+    MIN_JOINT_CALIBRATION_FRAMES = 3
+    MAX_JOINT_CALIBRATION_RMSE_PX = 2.0
 
     def __init__(self, camera_matrix, dist_coeffs, aruco_length, image_size=None, aruco_dict=cv2.aruco.DICT_6X6_1000, board_marker_layouts=None):
         self.camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
@@ -32,6 +34,8 @@ class Aruco_pose_Estimater(object):
         self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, params)
         self.anchor_marker_id = None
         self.marker_to_anchor_transforms = {}
+        self.board_calibration_frames = {}
+        self.board_calibration_results = {}
         self.marker_object_points = self.create_marker_object_points(self.aruco_length)
         if board_marker_layouts is None:
             board_marker_layouts = self.default_board_marker_layouts()
@@ -162,6 +166,22 @@ class Aruco_pose_Estimater(object):
     def pose_to_marker_from_camera(self, pose):
         return self.build_transform(pose['rotation_cam_to_obj'], pose['translation_cam_to_obj'])
 
+    @staticmethod
+    def transform_to_vector(transform):
+        rvec, _ = cv2.Rodrigues(
+            np.asarray(transform[:3, :3], dtype=np.float64)
+        )
+        return np.concatenate([
+            rvec.reshape(3),
+            np.asarray(transform[:3, 3], dtype=np.float64).reshape(3),
+        ])
+
+    @classmethod
+    def vector_to_transform(cls, vector):
+        vector = np.asarray(vector, dtype=np.float64).reshape(6)
+        rotation, _ = cv2.Rodrigues(vector[:3])
+        return cls.build_transform(rotation, vector[3:])
+
     def marker_points_in_board(self, marker_center):
         marker_center = np.asarray(marker_center, dtype=np.float64).reshape(3)
         return self.marker_object_points.astype(np.float64) + marker_center.reshape(1, 3)
@@ -285,6 +305,260 @@ class Aruco_pose_Estimater(object):
         board_poses = self.estimate_board_poses(corners, ids)
         return corners, ids, board_poses
 
+    def minimum_markers_for_joint_calibration(self, board_id):
+        marker_count = len(self.board_marker_layouts[int(board_id)])
+        return max(marker_count - 1, 1)
+
+    def pose_has_enough_markers_for_joint_calibration(self, board_id, pose):
+        visible_marker_count = len(pose.get('visible_board_marker_ids', []))
+        return (
+            visible_marker_count
+            >= self.minimum_markers_for_joint_calibration(board_id)
+        )
+
+    def collect_joint_calibration_frames(self, marker_poses):
+        registered_board_ids = [
+            board_id
+            for board_id in marker_poses
+            if board_id in self.marker_to_anchor_transforms
+        ]
+        unregistered_board_ids = [
+            board_id
+            for board_id in marker_poses
+            if board_id not in self.marker_to_anchor_transforms
+        ]
+
+        for reference_board_id in registered_board_ids:
+            reference_pose = marker_poses[reference_board_id]
+            if not self.pose_has_enough_markers_for_joint_calibration(
+                reference_board_id,
+                reference_pose,
+            ):
+                continue
+
+            for candidate_board_id in unregistered_board_ids:
+                candidate_pose = marker_poses[candidate_board_id]
+                if not self.pose_has_enough_markers_for_joint_calibration(
+                    candidate_board_id,
+                    candidate_pose,
+                ):
+                    continue
+
+                key = (int(reference_board_id), int(candidate_board_id))
+                frames = self.board_calibration_frames.setdefault(key, [])
+                frames.append({
+                    'reference_object_points': np.asarray(
+                        reference_pose['object_points'],
+                        dtype=np.float64,
+                    ).copy(),
+                    'reference_image_points': np.asarray(
+                        reference_pose['image_points'],
+                        dtype=np.float64,
+                    ).copy(),
+                    'candidate_object_points': np.asarray(
+                        candidate_pose['object_points'],
+                        dtype=np.float64,
+                    ).copy(),
+                    'candidate_image_points': np.asarray(
+                        candidate_pose['image_points'],
+                        dtype=np.float64,
+                    ).copy(),
+                    'reference_from_camera': self.pose_to_marker_from_camera(
+                        reference_pose
+                    ),
+                    'candidate_from_camera': self.pose_to_marker_from_camera(
+                        candidate_pose
+                    ),
+                    'reference_marker_ids': list(
+                        reference_pose['visible_board_marker_ids']
+                    ),
+                    'candidate_marker_ids': list(
+                        candidate_pose['visible_board_marker_ids']
+                    ),
+                })
+
+    @staticmethod
+    def choose_medoid_transform(transforms):
+        if not transforms:
+            return None
+        if len(transforms) == 1:
+            return np.asarray(transforms[0], dtype=np.float64).copy()
+
+        pairwise_costs = np.zeros(len(transforms), dtype=np.float64)
+        for source_idx, source_transform in enumerate(transforms):
+            for target_idx, target_transform in enumerate(transforms):
+                if target_idx <= source_idx:
+                    continue
+                delta = (
+                    Aruco_pose_Estimater.invert_transform(source_transform)
+                    @ target_transform
+                )
+                rotation_delta, _ = cv2.Rodrigues(delta[:3, :3])
+                cost = (
+                    np.linalg.norm(delta[:3, 3])
+                    + 50.0 * np.linalg.norm(rotation_delta)
+                )
+                pairwise_costs[source_idx] += cost
+                pairwise_costs[target_idx] += cost
+        return np.asarray(
+            transforms[int(np.argmin(pairwise_costs))],
+            dtype=np.float64,
+        ).copy()
+
+    def joint_calibration_residuals(self, parameters, frames):
+        reference_from_candidate = self.vector_to_transform(parameters[:6])
+        residuals = []
+
+        for frame_idx, frame in enumerate(frames):
+            camera_from_reference = self.vector_to_transform(
+                parameters[6 + frame_idx * 6:12 + frame_idx * 6]
+            )
+            rvec_camera_from_reference, _ = cv2.Rodrigues(
+                camera_from_reference[:3, :3]
+            )
+            tvec_camera_from_reference = camera_from_reference[:3, 3].reshape(
+                3,
+                1,
+            )
+
+            projected_reference, _ = cv2.projectPoints(
+                frame['reference_object_points'],
+                rvec_camera_from_reference,
+                tvec_camera_from_reference,
+                self.camera_matrix,
+                self.dist_coeffs,
+            )
+
+            candidate_points = frame['candidate_object_points']
+            candidate_points_in_reference = (
+                reference_from_candidate[:3, :3]
+                @ candidate_points.T
+            ).T + reference_from_candidate[:3, 3]
+            projected_candidate, _ = cv2.projectPoints(
+                candidate_points_in_reference,
+                rvec_camera_from_reference,
+                tvec_camera_from_reference,
+                self.camera_matrix,
+                self.dist_coeffs,
+            )
+
+            residuals.append(
+                (
+                    projected_reference.reshape(-1, 2)
+                    - frame['reference_image_points']
+                ).reshape(-1)
+            )
+            residuals.append(
+                (
+                    projected_candidate.reshape(-1, 2)
+                    - frame['candidate_image_points']
+                ).reshape(-1)
+            )
+
+        return np.concatenate(residuals)
+
+    def jointly_calibrate_board(self, candidate_board_id):
+        candidate_board_id = int(candidate_board_id)
+        candidate_keys = [
+            key
+            for key, frames in self.board_calibration_frames.items()
+            if (
+                key[1] == candidate_board_id
+                and key[0] in self.marker_to_anchor_transforms
+                and len(frames) >= self.MIN_JOINT_CALIBRATION_FRAMES
+            )
+        ]
+        if not candidate_keys:
+            return False
+
+        calibration_key = max(
+            candidate_keys,
+            key=lambda key: len(self.board_calibration_frames[key]),
+        )
+        reference_board_id, _ = calibration_key
+        frames = self.board_calibration_frames[calibration_key]
+
+        relative_transforms = []
+        camera_from_reference_initials = []
+        for frame in frames:
+            reference_from_camera = frame['reference_from_camera']
+            candidate_from_camera = frame['candidate_from_camera']
+            reference_from_candidate = (
+                reference_from_camera
+                @ self.invert_transform(candidate_from_camera)
+            )
+            relative_transforms.append(reference_from_candidate)
+            camera_from_reference_initials.append(
+                self.invert_transform(reference_from_camera)
+            )
+
+        initial_reference_from_candidate = self.choose_medoid_transform(
+            relative_transforms
+        )
+        initial_parameters = [self.transform_to_vector(
+            initial_reference_from_candidate
+        )]
+        initial_parameters.extend(
+            self.transform_to_vector(transform)
+            for transform in camera_from_reference_initials
+        )
+        initial_parameters = np.concatenate(initial_parameters)
+
+        try:
+            from scipy.optimize import least_squares
+        except ImportError as exc:
+            raise ImportError(
+                'Multi-frame ArUco board calibration requires scipy'
+            ) from exc
+
+        optimization = least_squares(
+            self.joint_calibration_residuals,
+            initial_parameters,
+            args=(frames,),
+            method='trf',
+            loss='soft_l1',
+            f_scale=1.0,
+            max_nfev=300,
+        )
+        residuals = self.joint_calibration_residuals(
+            optimization.x,
+            frames,
+        )
+        reprojection_rmse = float(np.sqrt(np.mean(np.square(residuals))))
+        if (
+            not np.all(np.isfinite(optimization.x))
+            or not np.isfinite(reprojection_rmse)
+            or reprojection_rmse > self.MAX_JOINT_CALIBRATION_RMSE_PX
+        ):
+            return False
+
+        reference_from_candidate = self.vector_to_transform(
+            optimization.x[:6]
+        )
+        anchor_from_reference = self.marker_to_anchor_transforms[
+            reference_board_id
+        ]
+        self.marker_to_anchor_transforms[candidate_board_id] = (
+            anchor_from_reference @ reference_from_candidate
+        )
+        self.board_calibration_results[candidate_board_id] = {
+            'reference_board_id': int(reference_board_id),
+            'frame_count': len(frames),
+            'reprojection_rmse': reprojection_rmse,
+            'optimizer_success': bool(optimization.success),
+            'optimizer_message': str(optimization.message),
+        }
+        print(
+            'joint ArUco calibration board {} -> anchor {} using {} frames: '
+            'rmse={:.4f}px'.format(
+                candidate_board_id,
+                self.anchor_marker_id,
+                len(frames),
+                reprojection_rmse,
+            )
+        )
+        return True
+
     def resolve_world_pose(self, marker_poses):
         if not marker_poses:
             return None
@@ -295,7 +569,26 @@ class Aruco_pose_Estimater(object):
                 return None
             self.marker_to_anchor_transforms[self.anchor_marker_id] = np.eye(4, dtype=np.float64)
 
+        self.collect_joint_calibration_frames(marker_poses)
+
+        preferred_board_id = self.choose_best_marker_pose(marker_poses)
+        if (
+            preferred_board_id is not None
+            and preferred_board_id not in self.marker_to_anchor_transforms
+        ):
+            self.jointly_calibrate_board(preferred_board_id)
+
         visible_known_marker_ids = [marker_id for marker_id in marker_poses if marker_id in self.marker_to_anchor_transforms]
+        if not visible_known_marker_ids:
+            for candidate_board_id in marker_poses:
+                if candidate_board_id in self.marker_to_anchor_transforms:
+                    continue
+                self.jointly_calibrate_board(candidate_board_id)
+            visible_known_marker_ids = [
+                marker_id
+                for marker_id in marker_poses
+                if marker_id in self.marker_to_anchor_transforms
+            ]
         if not visible_known_marker_ids:
             return None
 
@@ -305,13 +598,6 @@ class Aruco_pose_Estimater(object):
         anchor_from_reference = self.marker_to_anchor_transforms[reference_marker_id]
         reference_from_camera = self.pose_to_marker_from_camera(reference_pose)
         anchor_from_camera = anchor_from_reference @ reference_from_camera
-
-        for marker_id, marker_pose in marker_poses.items():
-            if marker_id in self.marker_to_anchor_transforms:
-                continue
-            marker_from_camera = self.pose_to_marker_from_camera(marker_pose)
-            camera_from_marker = self.invert_transform(marker_from_camera)
-            self.marker_to_anchor_transforms[marker_id] = anchor_from_camera @ camera_from_marker
 
         camera_from_anchor = self.invert_transform(anchor_from_camera)
         rotation_cam_to_world = anchor_from_camera[:3, :3]
@@ -334,6 +620,10 @@ class Aruco_pose_Estimater(object):
             'registered_marker_ids': sorted(int(marker_id) for marker_id in self.marker_to_anchor_transforms.keys()),
             'visible_board_ids': sorted(int(marker_id) for marker_id in marker_poses.keys()),
             'registered_board_ids': sorted(int(marker_id) for marker_id in self.marker_to_anchor_transforms.keys()),
+            'board_calibration_results': {
+                int(board_id): dict(result)
+                for board_id, result in self.board_calibration_results.items()
+            },
             'rotation_cam_to_world': rotation_cam_to_world,
             'translation_cam_to_world': translation_cam_to_world,
             'rotation_world_to_cam': rotation_world_to_cam,
@@ -426,6 +716,16 @@ class Aruco_pose_Estimater(object):
                 pose.get('reprojection_error_mean', 0.0),
             ),
         ]
+        calibration_result = pose.get('board_calibration_results', {}).get(
+            pose['reference_board_id']
+        )
+        if calibration_result is not None:
+            text_lines.append(
+                'JointCalib {} frames rmse {:.2f}px'.format(
+                    calibration_result['frame_count'],
+                    calibration_result['reprojection_rmse'],
+                )
+            )
         for line_idx, text in enumerate(text_lines):
             cv2.putText(
                 vis_frame,

@@ -20,38 +20,25 @@ ULTRALYTICS_DIR = WORKSPACE_DIR / "submodule" / "ultralytics"
 
 @dataclass(frozen=True)
 class IcpConfig:
-    coarse_voxel_size: float = 3.0
-    coarse_max_correspondence: float = 30.0
-    coarse_iterations: int = 60
-    fine_voxel_size: float = 1.0
-    fine_max_correspondence: float = 10.0
-    fine_iterations: int = 100
+    voxel_size: float = 3.0
+    max_correspondence: float = 30.0
+    iterations: int = 60
     fallback_fitness: float = 0.85
 
     @classmethod
     def from_config(cls, config):
         return cls(
-            coarse_voxel_size=float(config["coarse_voxel_size_mm"]),
-            coarse_max_correspondence=float(
-                config["coarse_max_correspondence_mm"]
-            ),
-            coarse_iterations=int(config["coarse_iterations"]),
-            fine_voxel_size=float(config["fine_voxel_size_mm"]),
-            fine_max_correspondence=float(
-                config["fine_max_correspondence_mm"]
-            ),
-            fine_iterations=int(config["fine_iterations"]),
+            voxel_size=float(config["voxel_size_mm"]),
+            max_correspondence=float(config["max_correspondence_mm"]),
+            iterations=int(config["iterations"]),
             fallback_fitness=float(config["fallback_fitness"]),
         )
 
     def validate(self) -> None:
         positive_values = {
-            "coarse_voxel_size": self.coarse_voxel_size,
-            "coarse_max_correspondence": self.coarse_max_correspondence,
-            "coarse_iterations": self.coarse_iterations,
-            "fine_voxel_size": self.fine_voxel_size,
-            "fine_max_correspondence": self.fine_max_correspondence,
-            "fine_iterations": self.fine_iterations,
+            "voxel_size": self.voxel_size,
+            "max_correspondence": self.max_correspondence,
+            "iterations": self.iterations,
         }
         for name, value in positive_values.items():
             if value <= 0:
@@ -73,10 +60,8 @@ class PoseEstimate:
     translation_mm: np.ndarray
     rpy_degrees: np.ndarray
     initialization: str
-    coarse_fitness: float
-    coarse_rmse_mm: float
-    fine_fitness: float
-    fine_rmse_mm: float
+    icp_fitness: float
+    icp_rmse_mm: float
     yolo_instance_count: int
     yolo_mask_pixels: int
     raw_point_count: int
@@ -111,10 +96,8 @@ class PoseEstimate:
             "yaw_deg": float(self.rpy_degrees[2]),
             "euler_convention": "R=Rz(yaw)*Ry(pitch)*Rx(roll)",
             "initialization": self.initialization,
-            "coarse_fitness": self.coarse_fitness,
-            "coarse_inlier_rmse_mm": self.coarse_rmse_mm,
-            "fine_fitness": self.fine_fitness,
-            "fine_inlier_rmse_mm": self.fine_rmse_mm,
+            "icp_fitness": self.icp_fitness,
+            "icp_inlier_rmse_mm": self.icp_rmse_mm,
             "scale_estimation_enabled": False,
             "rotation_determinant": float(np.linalg.det(rotation)),
             "rotation_singular_values": np.linalg.svd(
@@ -383,33 +366,33 @@ def _proper_signed_permutation_matrices():
     return matrices
 
 
-def _prepare_icp_cloud(cloud, voxel_size):
+def _prepare_icp_cloud(cloud, voxel_size, estimate_normals=False):
     registration_cloud = copy.deepcopy(cloud)
     registration_cloud = registration_cloud.voxel_down_sample(
         voxel_size=voxel_size
     )
     if len(registration_cloud.points) < 3:
         raise ValueError("Too few points for ICP registration")
-    registration_cloud.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(
-            radius=max(voxel_size * 2.0, 2.0),
-            max_nn=30,
+    if estimate_normals:
+        registration_cloud.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=max(voxel_size * 2.0, 2.0),
+                max_nn=30,
+            )
         )
-    )
     return registration_cloud
 
 
 class _TemporalRigidIcp:
     def __init__(self, target_cloud, config: IcpConfig):
         self.config = config
-        self.coarse_target = _prepare_icp_cloud(
-            target_cloud, config.coarse_voxel_size
-        )
-        self.fine_target = _prepare_icp_cloud(
-            target_cloud, config.fine_voxel_size
+        # Point-to-plane only needs target normals. The fixed target is prepared
+        # once, while per-frame source clouds only need voxel downsampling.
+        self.target = _prepare_icp_cloud(
+            target_cloud, config.voxel_size, estimate_normals=True
         )
         self.target_centroid, self.target_basis = _pca_basis(
-            np.asarray(self.coarse_target.points)
+            np.asarray(self.target.points)
         )
         self.axis_mappings = _proper_signed_permutation_matrices()
         self.previous_transform = None
@@ -417,19 +400,17 @@ class _TemporalRigidIcp:
     def reset(self):
         self.previous_transform = None
 
-    def _run_coarse(self, source, initial_transform):
+    def _run_icp(self, source, initial_transform):
         return o3d.pipelines.registration.registration_icp(
             source,
-            self.coarse_target,
-            self.config.coarse_max_correspondence,
+            self.target,
+            self.config.max_correspondence,
             init=initial_transform,
             estimation_method=(
-                o3d.pipelines.registration.TransformationEstimationPointToPoint(
-                    with_scaling=False
-                )
+                o3d.pipelines.registration.TransformationEstimationPointToPlane()
             ),
             criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=self.config.coarse_iterations
+                max_iteration=self.config.iterations
             ),
         )
 
@@ -444,9 +425,9 @@ class _TemporalRigidIcp:
             and candidate.inlier_rmse < best.inlier_rmse
         )
 
-    def _global_coarse_search(self, coarse_source):
+    def _global_search(self, source):
         source_centroid, source_basis = _pca_basis(
-            np.asarray(coarse_source.points)
+            np.asarray(source.points)
         )
         best_result = None
         for axis_mapping in self.axis_mappings:
@@ -456,7 +437,7 @@ class _TemporalRigidIcp:
             initial_transform[:3, 3] = (
                 self.target_centroid - rotation @ source_centroid
             )
-            result = self._run_coarse(coarse_source, initial_transform)
+            result = self._run_icp(source, initial_transform)
             if self._is_better(result, best_result):
                 best_result = result
         if best_result is None:
@@ -466,62 +447,37 @@ class _TemporalRigidIcp:
     def register(self, source_cloud):
         timings = {}
         stage_start = time.perf_counter()
-        coarse_source = _prepare_icp_cloud(
-            source_cloud, self.config.coarse_voxel_size
-        )
-        timings["icp_prepare_coarse_source"] = (
+        source = _prepare_icp_cloud(source_cloud, self.config.voxel_size)
+        timings["icp_prepare_source"] = (
             time.perf_counter() - stage_start
         )
 
         initialization = "temporal"
-        coarse_result = None
+        result = None
         if self.previous_transform is not None:
             stage_start = time.perf_counter()
-            coarse_result = self._run_coarse(
-                coarse_source, self.previous_transform
-            )
-            timings["icp_temporal_coarse"] = (
+            result = self._run_icp(source, self.previous_transform)
+            timings["icp_temporal"] = (
                 time.perf_counter() - stage_start
             )
 
         if (
-            coarse_result is None
-            or coarse_result.fitness < self.config.fallback_fitness
+            result is None
+            or result.fitness < self.config.fallback_fitness
         ):
             initialization = "pca24"
             stage_start = time.perf_counter()
-            global_result = self._global_coarse_search(coarse_source)
-            timings["icp_pca24_coarse"] = (
+            global_result = self._global_search(source)
+            timings["icp_pca24"] = (
                 time.perf_counter() - stage_start
             )
-            if self._is_better(global_result, coarse_result):
-                coarse_result = global_result
+            if self._is_better(global_result, result):
+                result = global_result
 
-        stage_start = time.perf_counter()
-        fine_source = _prepare_icp_cloud(
-            source_cloud, self.config.fine_voxel_size
-        )
-        timings["icp_prepare_fine_source"] = (
-            time.perf_counter() - stage_start
-        )
-        stage_start = time.perf_counter()
-        fine_result = o3d.pipelines.registration.registration_icp(
-            fine_source,
-            self.fine_target,
-            self.config.fine_max_correspondence,
-            init=coarse_result.transformation,
-            estimation_method=(
-                o3d.pipelines.registration.TransformationEstimationPointToPlane()
-            ),
-            criteria=o3d.pipelines.registration.ICPConvergenceCriteria(
-                max_iteration=self.config.fine_iterations
-            ),
-        )
-        timings["icp_fine"] = time.perf_counter() - stage_start
         self.previous_transform = np.asarray(
-            fine_result.transformation, dtype=np.float64
+            result.transformation, dtype=np.float64
         )
-        return initialization, coarse_result, fine_result, timings
+        return initialization, result, timings
 
 
 class PoseEstimator:
@@ -738,14 +694,14 @@ class PoseEstimator:
         )
 
         stage_start = time.perf_counter()
-        initialization, coarse_result, fine_result, icp_timings = (
+        initialization, icp_result, icp_timings = (
             self.icp.register(centered_cloud)
         )
         timings["icp_total"] = time.perf_counter() - stage_start
         timings.update(icp_timings)
 
         centered_to_target = np.asarray(
-            fine_result.transformation, dtype=np.float64
+            icp_result.transformation, dtype=np.float64
         )
         centering_transform = np.eye(4, dtype=np.float64)
         centering_transform[:3, 3] = -original_centroid
@@ -767,10 +723,8 @@ class PoseEstimator:
                 centered_to_target[:3, :3]
             ),
             initialization=initialization,
-            coarse_fitness=float(coarse_result.fitness),
-            coarse_rmse_mm=float(coarse_result.inlier_rmse),
-            fine_fitness=float(fine_result.fitness),
-            fine_rmse_mm=float(fine_result.inlier_rmse),
+            icp_fitness=float(icp_result.fitness),
+            icp_rmse_mm=float(icp_result.inlier_rmse),
             yolo_instance_count=int(instance_count),
             yolo_mask_pixels=int(yolo_mask.sum()),
             raw_point_count=int(raw_point_count),

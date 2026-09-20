@@ -13,6 +13,9 @@ reconstruction:
   aruco_length: 24.0
   stereo_method: foundation_stereo
   use_aruco: true
+  depth_range_mm:
+    min: 100
+    max: 600
   brightness_mask:
     enabled: true
     threshold: 40
@@ -20,11 +23,22 @@ reconstruction:
 segmentation:
   enabled: true
   method: yolo
-  yolo_model_path: huojian/d455_penguan_20260525/video/exp-2.pt
+  yolo_model_path: huojian/d455_penguan_20260525/video/huojian-600-640.pt
+  yolo_imgsz: 640
   yolo_device: null
 
 global_registration:
+  only: false
   method: pose_graph
+  pose_graph:
+    voxel_size_mm: 1.0
+    final_voxel_size_mm: 1.0
+    max_correspondence_distance_mm: 0.5
+    max_iteration: 100
+    loop_closure_stride: 30
+    preference_loop_closure: 0.1
+    edge_prune_threshold: 0.25
+    reference_node: 0
 
 runtime:
-  frame_stride: 1
+  frame_stride: 2
