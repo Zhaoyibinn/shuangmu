@@ -1,4 +1,5 @@
 import argparse
+from pathlib import Path
 import torch,os,sys,pdb
 import torch.nn as nn
 import torch.nn.functional as F
@@ -150,11 +151,18 @@ class DPT_DINOv2(nn.Module):
 
         assert encoder in ['vits', 'vitb', 'vitl']
 
-        # in case the Internet connection is not stable, please load the DINOv2 locally
-        # if localhub:
-        #     self.pretrained = torch.hub.load('torchhub/facebookresearch_dinov2_main', 'dinov2_{:}14'.format(encoder), source='local', pretrained=False)
-        # else:
-        self.pretrained = torch.hub.load('facebookresearch/dinov2', 'dinov2_{:}14'.format(encoder), pretrained=pretrained_dino)
+        foundation_dir = Path(__file__).resolve().parents[1]
+        self.pretrained = torch.hub.load(
+            str(foundation_dir / 'dinov2'),
+            f'dinov2_{encoder}14',
+            source='local',
+            pretrained=False,
+        )
+        if pretrained_dino:
+            weights_path = foundation_dir.parent / 'weights' / 'DINOv2' / f'dinov2_{encoder}14_pretrain.pth'
+            if not weights_path.is_file():
+                raise FileNotFoundError(f'DINOv2 weights not found: {weights_path}')
+            self.pretrained.load_state_dict(torch.load(weights_path, map_location='cpu', weights_only=True))
 
 
         dim = self.pretrained.blocks[0].attn.qkv.in_features
