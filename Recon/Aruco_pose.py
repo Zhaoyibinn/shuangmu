@@ -85,7 +85,16 @@ class Aruco_pose_Estimater(object):
 
     @classmethod
     def load_board_config(cls, board_yaml_path):
-        board_config = load_config(board_yaml_path)
+        with open(board_yaml_path, 'r', encoding='utf-8') as board_file:
+            board_config = yaml.safe_load(board_file) or {}
+        if 'defaults' in board_config:
+            board_config = load_config(board_yaml_path)
+        if not isinstance(board_config, dict):
+            raise ValueError(
+                'ArUco board configuration root must be a mapping: {}'.format(
+                    board_yaml_path
+                )
+            )
 
         aruco_length = None
         if 'aruco_length' in board_config:
@@ -102,16 +111,47 @@ class Aruco_pose_Estimater(object):
     @classmethod
     def from_yaml(cls, yaml_path, aruco_length, aruco_dict=cv2.aruco.DICT_6X6_1000, board_marker_layouts=None, board_yaml_path=None):
         with open(yaml_path, 'r', encoding='utf-8') as file:
-            calib = yaml.safe_load(file)
+            is_opencv_yaml = file.readline().startswith('%YAML:')
 
-        intrinsics = calib['rgb_intrinsics']
-        camera_matrix = np.array([
-            [intrinsics['fx'], 0.0, intrinsics['cx']],
-            [0.0, intrinsics['fy'], intrinsics['cy']],
-            [0.0, 0.0, 1.0],
-        ], dtype=np.float64)
-        dist_coeffs = np.zeros((5, 1), dtype=np.float64)
-        image_size = (int(intrinsics['width']), int(intrinsics['height']))
+        if is_opencv_yaml:
+            calibration = cv2.FileStorage(yaml_path, cv2.FILE_STORAGE_READ)
+            try:
+                camera_matrix = calibration.getNode('M1').mat()
+                dist_coeffs = calibration.getNode('D1').mat()
+                width = int(calibration.getNode('image_width').real())
+                height = int(calibration.getNode('image_height').real())
+            finally:
+                calibration.release()
+            if camera_matrix is None:
+                raise ValueError('M1 is missing from {}'.format(yaml_path))
+            if dist_coeffs is None:
+                dist_coeffs = np.zeros((5, 1), dtype=np.float64)
+            image_size = (width, height)
+        else:
+            with open(yaml_path, 'r', encoding='utf-8') as file:
+                calib = yaml.safe_load(file)
+            intrinsics = calib['rgb_intrinsics']
+            camera_matrix = np.array([
+                [intrinsics['fx'], 0.0, intrinsics['cx']],
+                [0.0, intrinsics['fy'], intrinsics['cy']],
+                [0.0, 0.0, 1.0],
+            ], dtype=np.float64)
+            distortion_coefficients = calib.get(
+                'distortion_coefficients',
+                intrinsics.get('distortion_coefficients', [0.0] * 5),
+            )
+            dist_coeffs = np.asarray(
+                distortion_coefficients,
+                dtype=np.float64,
+            ).reshape(-1, 1)
+            image_size = (int(intrinsics['width']), int(intrinsics['height']))
+
+        camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+        dist_coeffs = np.asarray(dist_coeffs, dtype=np.float64).reshape(-1, 1)
+        if dist_coeffs.size not in {4, 5, 8, 12, 14}:
+            raise ValueError(
+                'distortion_coefficients must contain 4, 5, 8, 12, or 14 values'
+            )
         if board_yaml_path is not None:
             board_aruco_length, board_marker_layouts = cls.load_board_config(board_yaml_path)
             if board_aruco_length is not None:
@@ -683,7 +723,19 @@ class Aruco_pose_Estimater(object):
         return world_pose
 
     def draw_pose_visualization(self, frame, pose, frame_idx):
-        vis_frame = frame.copy()
+        if frame.ndim == 2:
+            vis_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 1:
+            vis_frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif frame.ndim == 3 and frame.shape[2] == 3:
+            vis_frame = frame.copy()
+        elif frame.ndim == 3 and frame.shape[2] == 4:
+            vis_frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        else:
+            raise ValueError(
+                'pose visualization expects grayscale, BGR, or BGRA input; '
+                'got shape {}'.format(frame.shape)
+            )
         if pose is None:
             cv2.putText(
                 vis_frame,

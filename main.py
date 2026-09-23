@@ -28,11 +28,16 @@ def validate_config(config, global_registration_only=False):
     paths = config['paths']
     required_path_keys = ['save_dir']
     if not global_registration_only:
-        required_path_keys.extend([
-            'data_root_path',
-            'ext_yaml_path',
-            'int_yaml_path',
-        ])
+        required_path_keys.append('data_root_path')
+        input_mode = config['reconstruction']['input_mode']
+        if input_mode == 'stereo':
+            required_path_keys.extend(['ext_yaml_path', 'int_yaml_path'])
+        elif input_mode == 'direct_depth':
+            required_path_keys.append('int_yaml_path')
+        else:
+            raise ValueError(
+                "reconstruction.input_mode must be 'stereo' or 'direct_depth'"
+            )
     for key in required_path_keys:
         if not paths[key]:
             raise ValueError('paths.{} must be configured'.format(key))
@@ -96,10 +101,13 @@ def main():
     segmentation_config = config['segmentation']
     registration_config = config['global_registration']
     runtime_config = config['runtime']
+    camera_calibration_path = paths['color_ext_yaml_path']
+    if reconstruction_config['input_mode'] == 'direct_depth':
+        camera_calibration_path = paths['int_yaml_path']
 
     reconstruction = Reconstruction(
         data_root_path=paths['data_root_path'],
-        color_ext_yaml_path=paths['color_ext_yaml_path'],
+        color_ext_yaml_path=camera_calibration_path,
         aruco_board_yaml_path=paths['aruco_board_yaml_path'],
         aruco_length=reconstruction_config['aruco_length'],
         world_voxel_size_mm=reconstruction_config['world_voxel_size_mm'],
@@ -121,6 +129,7 @@ def main():
             'statistical_std_ratio'
         ],
         initialize_processing=not global_registration_only,
+        input_mode=reconstruction_config['input_mode'],
     )
     reconstruction.prepare_outputs(save_dir=paths['save_dir'])
 
@@ -145,6 +154,7 @@ def main():
         data_root_path=paths['data_root_path'],
         ext_yaml_path=paths['ext_yaml_path'],
         int_yaml_path=paths['int_yaml_path'],
+        input_mode=reconstruction_config['input_mode'],
         color_ext_yaml_path=paths['color_ext_yaml_path'],
         min_depth_mm=reconstruction_config['depth_range_mm']['min'],
         max_depth_mm=reconstruction_config['depth_range_mm']['max'],

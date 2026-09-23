@@ -10,20 +10,23 @@ import open3d as o3d
 import yaml
 
 from Recon.Aruco_pose import Aruco_pose_Estimater
-from jiegouguang.jiegouguang_class import JieGouGuang
 
 
 WORKSPACE_DIR = Path(__file__).resolve().parents[1]
 ULTRALYTICS_DIR = WORKSPACE_DIR / 'submodule' / 'ultralytics'
 EJRGF_PYTHON_DIR = WORKSPACE_DIR / 'EJRGF' / 'src' / 'python'
-try:
-    from ultralytics.models.sam import SAM3DynamicInteractivePredictor
-except ImportError:
-    if ULTRALYTICS_DIR.exists():
-        sys.path.insert(0, str(ULTRALYTICS_DIR))
+
+
+def import_sam3_predictor():
+    try:
         from ultralytics.models.sam import SAM3DynamicInteractivePredictor
-    else:
-        raise
+    except ImportError:
+        if ULTRALYTICS_DIR.exists():
+            sys.path.insert(0, str(ULTRALYTICS_DIR))
+            from ultralytics.models.sam import SAM3DynamicInteractivePredictor
+        else:
+            raise
+    return SAM3DynamicInteractivePredictor
 
 
 def import_yolo():
@@ -90,6 +93,7 @@ class Reconstruction(object):
         aruco_board_yaml_path=None,
         use_sam=None,
         initialize_processing=True,
+        input_mode='stereo',
     ):
         self.color_ext_yaml_path = color_ext_yaml_path
         self.aruco_length = float(aruco_length)
@@ -118,13 +122,18 @@ class Reconstruction(object):
         self.sem_statistical_nb_neighbors = int(sem_statistical_nb_neighbors)
         self.sem_statistical_std_ratio = float(sem_statistical_std_ratio)
         self.data_root_path = data_root_path
+        self.input_mode = str(input_mode).lower()
+        if self.input_mode not in {'stereo', 'direct_depth'}:
+            raise ValueError('unsupported input mode: {}'.format(input_mode))
         logging.getLogger('ultralytics').setLevel(logging.ERROR)
 
         if initialize_processing and self.data_root_path is None:
             raise ValueError('Reconstruction requires data_root_path')
 
         self.jiegouguang = None
-        if initialize_processing:
+        if initialize_processing and self.input_mode == 'stereo':
+            from jiegouguang.jiegouguang_class import JieGouGuang
+
             rgb_path = os.path.join(self.data_root_path, 'color')
             self.jiegouguang = JieGouGuang(
                 os.path.join(self.data_root_path, 'left'),
@@ -503,7 +512,8 @@ class Reconstruction(object):
         points = np.vstack(points_list).tolist()
         labels = np.int_(np.concatenate(labels_list)).tolist()
         overrides = dict(conf=0.01, task='segment', mode='predict', imgsz=1008, model=self.sam_model_path, save=False, verbose=False)
-        self.predictor = SAM3DynamicInteractivePredictor(overrides=overrides, max_obj_num=10)
+        predictor_class = import_sam3_predictor()
+        self.predictor = predictor_class(overrides=overrides, max_obj_num=10)
         self.predictor(source=refer_images[0], points=[points], labels=[labels], obj_ids=[0], update_memory=True)
 
     def init_yolo(self):
@@ -690,13 +700,22 @@ class Reconstruction(object):
     def process_frame(self, sample):
         idx = sample['idx']
         camera_params = sample['camera_params']
-        self.configure_stereo_context(sample)
-        # 继承相机参数
-
-        disparity_raw = self.jiegouguang.forward_disparity()
-        depth = (float(camera_params['K1'][0, 0]) * abs(float(camera_params['cam_t'][0]))) / disparity_raw
-        depth = np.clip(depth, camera_params['min_dis'], camera_params['max_dis'])
-        depth = self.apply_brightness_mask(depth, sample['left_rectified'])
+        disparity_raw = None
+        if self.input_mode == 'direct_depth':
+            depth = np.asarray(sample['depth'], dtype=np.float64).copy()
+            valid_mask = np.asarray(sample['mask']) > 0
+            valid_mask &= np.isfinite(depth)
+            valid_mask &= depth >= float(camera_params['min_dis'])
+            valid_mask &= depth <= float(camera_params['max_dis'])
+            depth[~valid_mask] = 0
+            depth = self.apply_brightness_mask(depth, sample['gray_left'])
+        else:
+            self.configure_stereo_context(sample)
+            # 继承相机参数
+            disparity_raw = self.jiegouguang.forward_disparity()
+            depth = (float(camera_params['K1'][0, 0]) * abs(float(camera_params['cam_t'][0]))) / disparity_raw
+            depth = np.clip(depth, camera_params['min_dis'], camera_params['max_dis'])
+            depth = self.apply_brightness_mask(depth, sample['left_rectified'])
         self.depth_list.append(depth)
         # 推理深度图
 
@@ -735,11 +754,18 @@ class Reconstruction(object):
             }
         # 如果有语义分割就识别目标并且分割
 
-        pcd = self.jiegouguang.depth2pointcloud(
-            depth,
-            color_image=rgb,
-            camera_matrix=point_cloud_camera_matrix,
-        )
+        point_cloud_color = rgb
+        if self.input_mode == 'direct_depth':
+            point_cloud_color = sample['gray_left']
+            pcd = self.depth_to_point_cloud(
+                depth, point_cloud_color, point_cloud_camera_matrix
+            )
+        else:
+            pcd = self.jiegouguang.depth2pointcloud(
+                depth,
+                color_image=point_cloud_color,
+                camera_matrix=point_cloud_camera_matrix,
+            )
         if len(pcd.colors) == 0:
             pcd.colors = o3d.utility.Vector3dVector(np.repeat([[1.0, 0.0, 0.0]], len(pcd.points), axis=0))
         # 生成点云
@@ -795,6 +821,28 @@ class Reconstruction(object):
             'pcd_sam': pcd_sam,
             'pcd_sam_world': pcd_sam_world,
         }
+
+    @staticmethod
+    def depth_to_point_cloud(depth, image, camera_matrix):
+        depth = np.asarray(depth, dtype=np.float64)
+        camera_matrix = np.asarray(camera_matrix, dtype=np.float64)
+        valid = np.isfinite(depth) & (depth > 0)
+        pcd = o3d.geometry.PointCloud()
+        if not np.any(valid):
+            return pcd
+
+        rows, cols = np.indices(depth.shape)
+        z = depth[valid]
+        x = (cols[valid] - camera_matrix[0, 2]) * z / camera_matrix[0, 0]
+        y = (rows[valid] - camera_matrix[1, 2]) * z / camera_matrix[1, 1]
+        pcd.points = o3d.utility.Vector3dVector(np.stack((x, y, z), axis=-1))
+
+        if image is not None and image.shape[:2] == depth.shape:
+            colors = image[valid].astype(np.float64) / 255.0
+            if colors.ndim == 1:
+                colors = np.repeat(colors[:, None], 3, axis=1)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
+        return pcd
 
     def save_frame_result(self, result):
         idx = result['idx']

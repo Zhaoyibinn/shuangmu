@@ -1,0 +1,37 @@
+defaults: default.yaml
+
+paths:
+  data_root_path: huojian/shengxiang/continuous
+  save_dir: depth_outputs/shengxiang/continuous
+  int_yaml_path: biaoding/intrinsics_shenxiang.yaml
+  aruco_board_yaml_path: config/aruco_board/shenxiang.yaml
+
+reconstruction:
+  input_mode: direct_depth
+  stereo_method: null
+  world_voxel_size_mm: 3.0
+  use_aruco: true
+  depth_range_mm:
+    min: 100
+    max: 8000
+  brightness_mask:
+    enabled: false
+
+segmentation:
+  enabled: false
+
+global_registration:
+  only: false
+  method: pose_graph
+  pose_graph:
+    voxel_size_mm: 1.0
+    final_voxel_size_mm: 1.0
+    max_correspondence_distance_mm: 0.5
+    max_iteration: 100
+    loop_closure_stride: 1
+    preference_loop_closure: 0.1
+    edge_prune_threshold: 0.25
+    reference_node: 0
+
+runtime:
+  frame_stride: 1

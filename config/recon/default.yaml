@@ -7,6 +7,7 @@ paths:
   aruco_board_yaml_path: config/aruco_board/main.yaml
 
 reconstruction:
+  input_mode: stereo
   world_voxel_size_mm: 1.0
   aruco_length: 148.0
   stereo_method: fast_foundation_stereo

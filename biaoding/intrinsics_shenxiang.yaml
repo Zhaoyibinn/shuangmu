@@ -1,0 +1,18 @@
+%YAML:1.0
+---
+# Shengxiang Sizector-S1622100L intrinsics at 1332 x 760.
+# Calibration date: 2026-08-21
+image_width: 1332
+image_height: 760
+M1: !!opencv-matrix
+   rows: 3
+   cols: 3
+   dt: d
+   data: [ 2290.6923828125, 0.0, 666.2177734375,
+           0.0, 2290.559326171875, 375.2464904785156,
+           0.0, 0.0, 1.0 ]
+D1: !!opencv-matrix
+   rows: 1
+   cols: 5
+   dt: d
+   data: [ -0.000043138661567354575, 0.0, 0.0, 0.0, 0.0 ]
