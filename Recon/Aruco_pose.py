@@ -737,9 +737,12 @@ class Aruco_pose_Estimater(object):
                 'got shape {}'.format(frame.shape)
             )
         if pose is None:
+            corners, ids, _ = self.detector.detectMarkers(frame)
+            if ids is not None and len(ids) > 0:
+                cv2.aruco.drawDetectedMarkers(vis_frame, corners, ids)
             cv2.putText(
                 vis_frame,
-                'Frame {}: no marker'.format(frame_idx),
+                'Frame {}: no world pose'.format(frame_idx),
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,

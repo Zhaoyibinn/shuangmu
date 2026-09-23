@@ -9,6 +9,9 @@ paths:
 reconstruction:
   input_mode: stereo
   world_voxel_size_mm: 1.0
+  statistical_nb_neighbors: 0
+  statistical_std_ratio: 2.0
+  aruco_min_joint_calibration_frames: 3
   aruco_length: 148.0
   stereo_method: fast_foundation_stereo
   use_aruco: false

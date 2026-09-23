@@ -94,6 +94,8 @@ class Reconstruction(object):
         use_sam=None,
         initialize_processing=True,
         input_mode='stereo',
+        statistical_nb_neighbors=0,
+        statistical_std_ratio=2.0,
     ):
         self.color_ext_yaml_path = color_ext_yaml_path
         self.aruco_length = float(aruco_length)
@@ -121,6 +123,10 @@ class Reconstruction(object):
         self.yolo_device = yolo_device
         self.sem_statistical_nb_neighbors = int(sem_statistical_nb_neighbors)
         self.sem_statistical_std_ratio = float(sem_statistical_std_ratio)
+        self.statistical_nb_neighbors = int(statistical_nb_neighbors)
+        self.statistical_std_ratio = float(statistical_std_ratio)
+        if self.statistical_nb_neighbors < 0 or self.statistical_std_ratio <= 0:
+            raise ValueError('statistical filter requires neighbors >= 0 and std ratio > 0')
         self.data_root_path = data_root_path
         self.input_mode = str(input_mode).lower()
         if self.input_mode not in {'stereo', 'direct_depth'}:
@@ -640,6 +646,15 @@ class Reconstruction(object):
         )
         return filtered_cloud
 
+    def filter_frame_point_cloud(self, point_cloud):
+        if self.statistical_nb_neighbors == 0 or len(point_cloud.points) <= self.statistical_nb_neighbors:
+            return point_cloud
+        filtered_cloud, _ = point_cloud.remove_statistical_outlier(
+            nb_neighbors=self.statistical_nb_neighbors,
+            std_ratio=self.statistical_std_ratio,
+        )
+        return filtered_cloud
+
     def init_aruco(self):
         if not self.use_aruco:
             return
@@ -768,6 +783,7 @@ class Reconstruction(object):
             )
         if len(pcd.colors) == 0:
             pcd.colors = o3d.utility.Vector3dVector(np.repeat([[1.0, 0.0, 0.0]], len(pcd.points), axis=0))
+        pcd = self.filter_frame_point_cloud(pcd)
         # 生成点云
 
         pcd_world = None

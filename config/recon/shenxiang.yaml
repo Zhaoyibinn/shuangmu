@@ -10,10 +10,13 @@ reconstruction:
   input_mode: direct_depth
   stereo_method: null
   world_voxel_size_mm: 3.0
+  statistical_nb_neighbors: 20
+  statistical_std_ratio: 2.0
+  aruco_min_joint_calibration_frames: 3
   use_aruco: true
   depth_range_mm:
     min: 100
-    max: 8000
+    max: 10000
   brightness_mask:
     enabled: false
 
