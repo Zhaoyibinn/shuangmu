@@ -1,7 +1,6 @@
 
 import cv2
 import numpy as np
-import open3d as o3d
 import yaml
 
 from Recon.config_loader import load_config
@@ -794,6 +793,8 @@ class Aruco_pose_Estimater(object):
         return vis_frame
 
     def transform_point_cloud(self, point_cloud, pose):
+        import open3d as o3d
+
         if point_cloud is None or pose is None or len(point_cloud.points) == 0:
             return o3d.geometry.PointCloud()
 
