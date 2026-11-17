@@ -243,6 +243,9 @@ def open_pose_csv(csv_path: Path):
         "relative_to_first_roll_deg",
         "relative_to_first_pitch_deg",
         "relative_to_first_yaw_deg",
+        "gt_axis_pitch_deg",
+        "gt_axis_yaw_deg",
+        "gt_axis_tilt_deg",
         "rotation_center_estimated",
         "rotation_center_x_mm",
         "rotation_center_y_mm",
@@ -294,13 +297,63 @@ def rpy_degrees_to_matrix(rpy_degrees):
     )
 
 
-def remove_x_axis_rotation(transform):
-    adjusted = transform.copy()
-    rpy_degrees = matrix_to_rpy_degrees(adjusted[:3, :3])
-    removed_roll_degrees = float(rpy_degrees[0])
-    rpy_degrees[0] = 0.0
-    adjusted[:3, :3] = rpy_degrees_to_matrix(rpy_degrees)
-    return adjusted, removed_roll_degrees
+def remove_gt_x_axis_rotation(transform):
+    """Remove twist about the GT X axis from a camera-to-GT pose.
+
+    The symmetry axis is the line through the GT origin along +X. Choose
+    the inverse of the shortest rotation from GT +X to the camera-space
+    nozzle axis. This representative depends only on R.T @ [1, 0, 0], so
+    arbitrary LEFT multiplication by a GT-X rotation cannot change it.
+    Apply the same GT rotation to translation to preserve the rigid map.
+    Raw ICP poses must be kept separately from this analysis pose.
+    """
+    adjusted = np.asarray(transform, dtype=np.float64).copy()
+    rotation = adjusted[:3, :3].copy()
+    axis = rotation[0, :].copy()
+    axis /= np.linalg.norm(axis)
+    cross = np.cross([1.0, 0.0, 0.0], axis)
+    cosine = float(np.clip(axis[0], -1.0, 1.0))
+    if cosine < 0 and np.linalg.norm(cross) < 1e-12:
+        # At the antipode the shortest swing is not unique. Choose GT Y.
+        swing = np.diag([-1.0, 1.0, -1.0])
+    else:
+        skew = np.array([[0., -cross[2], cross[1]],
+                         [cross[2], 0., -cross[0]],
+                         [-cross[1], cross[0], 0.]])
+        # Use sin^2/(1-cos) near the antipode to avoid cancellation.
+        denominator = (1.0 + cosine if cosine >= 0 else
+                       float(cross @ cross) / (1.0 - cosine))
+        swing = np.eye(3) + skew + skew @ skew / denominator
+    canonical_rotation = swing.T
+    correction = canonical_rotation @ rotation.T
+    adjusted[:3, :3] = canonical_rotation
+    adjusted[:3, 3] = correction @ adjusted[:3, 3]
+    removed = np.degrees(np.arctan2(correction[1, 2], correction[1, 1]))
+    return adjusted, float(removed)
+
+
+def gt_axis_rotation_angles(first_camera_to_gt, current_camera_to_gt):
+    """Two axis-direction angles, invariant to independent GT-X ICP twists.
+
+    Use a fixed reference: the twist-free first camera-to-GT rotation. In
+    that frame the first nozzle axis is +X; its transverse axes are fixed
+    by minimum swing. The two angles obey u=Rz(yaw) Ry(pitch) [1,0,0].
+    Neither raw ICP poses nor translations are modified.
+    """
+    first, _ = remove_gt_x_axis_rotation(first_camera_to_gt)
+    _, removed = remove_gt_x_axis_rotation(current_camera_to_gt)
+    direction = first[:3, :3] @ np.asarray(current_camera_to_gt)[:3, :3].T @ np.array([1., 0., 0.])
+    direction /= np.linalg.norm(direction)
+    x, y, z = direction
+    return {
+        "gt_axis_pitch_deg": float(np.degrees(np.arctan2(-z, np.hypot(x, y)))),
+        "gt_axis_yaw_deg": float(np.degrees(np.arctan2(y, x))),
+        "gt_axis_tilt_deg": float(np.degrees(np.arctan2(np.hypot(y, z), x))),
+        "gt_axis_direction_in_reference": direction.tolist(),
+        "gt_axis_angle_convention": "u=Rz(yaw) Ry(pitch) X; reference=minimum-swing first camera-to-GT rotation",
+        "removed_x_rotation_deg": removed,
+        "rotation_removal": "GT-X post-ICP axis angles only",
+    }
 
 
 def format_optional_float(value):
@@ -325,12 +378,17 @@ def save_angle_plot(records, plot_path):
 
     frame_indices = [record["frame_index"] for record in records]
     angles = [
-        record["rotation_angle_about_center_deg"]
+        record.get("gt_axis_tilt_deg", record["rotation_angle_about_center_deg"])
         for record in records
     ]
 
     fig, ax = plt.subplots(figsize=(9, 4.8))
-    ax.plot(frame_indices, angles, marker="o", linewidth=1.8)
+    if all("gt_axis_pitch_deg" in record and "gt_axis_yaw_deg" in record for record in records):
+        for field, label in (("gt_axis_pitch_deg", "Y tilt"), ("gt_axis_yaw_deg", "Z tilt")):
+            ax.plot(frame_indices, [record[field] for record in records], marker="o", linewidth=1.8, label=label)
+        ax.legend()
+    else:
+        ax.plot(frame_indices, angles, marker="o", linewidth=1.8)
     ax.set_xlabel("frame")
     ax.set_ylabel("angle (deg)")
     ax.set_title("Rotation angle")
@@ -346,6 +404,8 @@ def save_rotation_angle_csv(records, csv_path):
         "frame_index",
         "frame_name",
         "angle_deg",
+        "gt_axis_pitch_deg",
+        "gt_axis_yaw_deg",
         "rotation_center_x_mm",
         "rotation_center_y_mm",
         "rotation_center_z_mm",
@@ -360,8 +420,10 @@ def save_rotation_angle_csv(records, csv_path):
                     "frame_index": record["frame_index"],
                     "frame_name": record["frame_name"],
                     "angle_deg": (
-                        record["rotation_angle_about_center_deg"]
+                        record.get("gt_axis_tilt_deg", record["rotation_angle_about_center_deg"])
                     ),
+                    "gt_axis_pitch_deg": record.get("gt_axis_pitch_deg"),
+                    "gt_axis_yaw_deg": record.get("gt_axis_yaw_deg"),
                     "rotation_center_x_mm": (
                         record["rotation_center_x_mm"]
                     ),
@@ -463,7 +525,9 @@ def save_estimate(
             "relative_pose_convention": (
                 "transform_original_source_to_first maps current frame "
                 "original source coordinates into the first successful "
-                "frame original source coordinates"
+                "frame original source coordinates; computed as "
+                "inverse(first camera-to-GT pose) @ current camera-to-GT pose; "
+                "raw six-DoF ICP poses; GT-X twist removal applies only to gt_axis_* angles"
             ),
             "relative_to_first_tx_mm": float(relative_translation[0]),
             "relative_to_first_ty_mm": float(relative_translation[1]),
@@ -529,7 +593,7 @@ def main():
     relative_reference = None
     rotation_point_estimator = IncrementalRotationPointEstimator()
     sequence_start = time.perf_counter()
-    print("frame, angle(deg), rotation_center(mm)", flush=True)
+    print("frame, GT-axis Y tilt(deg), GT-axis Z tilt(deg), rotation_center(mm)", flush=True)
     try:
         for position, frame_index in enumerate(frame_indices, start=1):
             frame_start = time.perf_counter()
@@ -562,26 +626,23 @@ def main():
                     )
                     continue
 
+                analysis_pose = estimate.original_to_target
                 if first_pose_inv is None:
                     first_pose_inv = np.linalg.inv(
-                        estimate.original_to_target
+                        analysis_pose
                     )
                     relative_reference = {
                         "frame_index": estimate.frame_index,
                         "frame_name": estimate.frame_name,
                     }
                 relative_to_first = (
-                    first_pose_inv @ estimate.original_to_target
-                )
-                relative_to_first, removed_x_rotation_degrees = (
-                    remove_x_axis_rotation(relative_to_first)
+                    first_pose_inv @ analysis_pose
                 )
                 rotation_analysis = rotation_point_estimator.add(
                     relative_to_first
                 )
-                rotation_analysis["removed_x_rotation_deg"] = (
-                    removed_x_rotation_degrees
-                )
+                rotation_analysis.update(gt_axis_rotation_angles(
+                    np.linalg.inv(first_pose_inv), estimate.original_to_target))
 
                 record = save_estimate(
                     estimate,
@@ -621,6 +682,9 @@ def main():
                         "relative_to_first_roll_deg": relative_rpy[0],
                         "relative_to_first_pitch_deg": relative_rpy[1],
                         "relative_to_first_yaw_deg": relative_rpy[2],
+                        "gt_axis_pitch_deg": rotation_analysis["gt_axis_pitch_deg"],
+                        "gt_axis_yaw_deg": rotation_analysis["gt_axis_yaw_deg"],
+                        "gt_axis_tilt_deg": rotation_analysis["gt_axis_tilt_deg"],
                         "rotation_center_estimated": (
                             rotation_analysis[
                                 "rotation_center_estimated"
@@ -691,11 +755,10 @@ def main():
                 csv_file.flush()
                 records.append(record)
                 print(
-                    "{}, {:+.3f}, ({},{},{})".format(
+                    "{}, {:+.3f}, {:+.3f}, ({},{},{})".format(
                         estimate.frame_name,
-                        rotation_analysis[
-                            "rotation_angle_about_center_deg"
-                        ],
+                        rotation_analysis["gt_axis_pitch_deg"],
+                        rotation_analysis["gt_axis_yaw_deg"],
                         format_optional_float(
                             rotation_analysis["rotation_center_x_mm"]
                         ),
@@ -796,11 +859,13 @@ def main():
         "relative_pose_reference": relative_reference,
         "relative_pose_convention": (
             "transform_original_source_to_first = "
-            "inverse(first transform_original_source_to_target) @ "
-            "current transform_original_source_to_target, then x-axis "
-            "rotation/roll is removed before saving relative pose and "
-            "estimating rotation angle/center"
+            "inverse(first camera-to-GT pose) @ current camera-to-GT pose; "
+            "raw six-DoF ICP; GT-X twist removal applies only to gt_axis_* angles"
         ),
+        "rotation_removal": "GT-X post-ICP axis angles only",
+        "rotation_parameterization": "unconstrained six-DoF ICP",
+        "symmetry_axis_gt": [1.0, 0.0, 0.0],
+        "symmetry_axis_origin_gt_mm": [0.0, 0.0, 0.0],
         "translation_unit": "mm",
         "rotation_unit": "degree",
         "rotation_angle_csv": str(angle_csv_path),

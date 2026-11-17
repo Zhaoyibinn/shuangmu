@@ -23,7 +23,7 @@ reconstruction:
 segmentation:
   enabled: true
   method: yolo
-  yolo_model_path: huojian/d455_penguan_20260525/video/huojian-600-640.pt
+  yolo_model_path: jiegouguang/weights/yolo/suobipengguan/last.pt
   yolo_imgsz: 640
   yolo_device: null
 

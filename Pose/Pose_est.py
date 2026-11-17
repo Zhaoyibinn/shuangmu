@@ -1,5 +1,4 @@
 import copy
-import itertools
 import math
 import sys
 import time
@@ -23,6 +22,7 @@ class IcpConfig:
     voxel_size: float = 3.0
     max_correspondence: float = 30.0
     iterations: int = 60
+    # Retained for compatibility with existing YAML; PCA fallback is disabled.
     fallback_fitness: float = 0.85
 
     @classmethod
@@ -344,28 +344,6 @@ def _filter_and_center_cloud(
     return cloud, centroid
 
 
-def _pca_basis(points):
-    centroid = points.mean(axis=0)
-    centered = points - centroid
-    covariance = centered.T @ centered / max(len(points) - 1, 1)
-    _, eigenvectors = np.linalg.eigh(covariance)
-    basis = eigenvectors[:, ::-1]
-    basis[:, 2] = np.cross(basis[:, 0], basis[:, 1])
-    basis[:, 2] /= np.linalg.norm(basis[:, 2])
-    return centroid, basis
-
-
-def _proper_signed_permutation_matrices():
-    matrices = []
-    for permutation in itertools.permutations(range(3)):
-        permutation_matrix = np.eye(3)[:, permutation]
-        for signs in itertools.product((-1.0, 1.0), repeat=3):
-            candidate = permutation_matrix @ np.diag(signs)
-            if np.linalg.det(candidate) > 0:
-                matrices.append(candidate)
-    return matrices
-
-
 def _prepare_icp_cloud(cloud, voxel_size, estimate_normals=False):
     registration_cloud = copy.deepcopy(cloud)
     registration_cloud = registration_cloud.voxel_down_sample(
@@ -384,6 +362,8 @@ def _prepare_icp_cloud(cloud, voxel_size, estimate_normals=False):
 
 
 class _TemporalRigidIcp:
+    """Initialize with centroid translation, then track from the previous pose."""
+
     def __init__(self, target_cloud, config: IcpConfig):
         self.config = config
         # Point-to-plane only needs target normals. The fixed target is prepared
@@ -391,10 +371,7 @@ class _TemporalRigidIcp:
         self.target = _prepare_icp_cloud(
             target_cloud, config.voxel_size, estimate_normals=True
         )
-        self.target_centroid, self.target_basis = _pca_basis(
-            np.asarray(self.target.points)
-        )
-        self.axis_mappings = _proper_signed_permutation_matrices()
+        self.target_centroid = np.asarray(self.target.points).mean(axis=0)
         self.previous_transform = None
 
     def reset(self):
@@ -414,36 +391,6 @@ class _TemporalRigidIcp:
             ),
         )
 
-    @staticmethod
-    def _is_better(candidate, best):
-        if candidate is None:
-            return False
-        if best is None or candidate.fitness > best.fitness:
-            return True
-        return (
-            np.isclose(candidate.fitness, best.fitness)
-            and candidate.inlier_rmse < best.inlier_rmse
-        )
-
-    def _global_search(self, source):
-        source_centroid, source_basis = _pca_basis(
-            np.asarray(source.points)
-        )
-        best_result = None
-        for axis_mapping in self.axis_mappings:
-            rotation = self.target_basis @ axis_mapping @ source_basis.T
-            initial_transform = np.eye(4, dtype=np.float64)
-            initial_transform[:3, :3] = rotation
-            initial_transform[:3, 3] = (
-                self.target_centroid - rotation @ source_centroid
-            )
-            result = self._run_icp(source, initial_transform)
-            if self._is_better(result, best_result):
-                best_result = result
-        if best_result is None:
-            raise RuntimeError("Failed to produce an ICP initialization")
-        return best_result
-
     def register(self, source_cloud):
         timings = {}
         stage_start = time.perf_counter()
@@ -452,27 +399,19 @@ class _TemporalRigidIcp:
             time.perf_counter() - stage_start
         )
 
-        initialization = "temporal"
-        result = None
-        if self.previous_transform is not None:
-            stage_start = time.perf_counter()
-            result = self._run_icp(source, self.previous_transform)
-            timings["icp_temporal"] = (
-                time.perf_counter() - stage_start
+        if self.previous_transform is None:
+            initialization = "centroid"
+            initial_transform = np.eye(4, dtype=np.float64)
+            initial_transform[:3, 3] = (
+                self.target_centroid - np.asarray(source.points).mean(axis=0)
             )
+        else:
+            initialization = "temporal"
+            initial_transform = self.previous_transform.copy()
 
-        if (
-            result is None
-            or result.fitness < self.config.fallback_fitness
-        ):
-            initialization = "pca24"
-            stage_start = time.perf_counter()
-            global_result = self._global_search(source)
-            timings["icp_pca24"] = (
-                time.perf_counter() - stage_start
-            )
-            if self._is_better(global_result, result):
-                result = global_result
+        stage_start = time.perf_counter()
+        result = self._run_icp(source, initial_transform)
+        timings["icp_" + initialization] = time.perf_counter() - stage_start
 
         self.previous_transform = np.asarray(
             result.transformation, dtype=np.float64

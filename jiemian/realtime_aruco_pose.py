@@ -28,6 +28,21 @@ def project_path(value):
     return path if path.is_absolute() else ROOT / path
 
 
+def pose_storage_root(value, camera_type):
+    folders = {'shenxiang': 'shengxiang_pose', 'realsense_d455': 'realsense_pose'}
+    if camera_type not in folders:
+        raise ValueError('未知相机类型')
+    root = project_path(value)
+    parts = list(root.parts)
+    aliases = {'shengxiang', 'shenxiang', 'realsense', 'realsense_d455',
+               'shengxiang_pose', 'shenxiang_pose', 'realsense_pose', 'realsense_d455_pose'}
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] in aliases:
+            parts[index] = folders[camera_type]
+            return Path(*parts)
+    return root / folders[camera_type]
+
+
 def display_image(image, max_width=1332):
     """Resize only UI outputs; detection and disk images stay at native size."""
     if image is None or image.shape[1] <= max_width:
@@ -54,11 +69,18 @@ def rotation_euler_xyz_deg(rotation):
 
 
 def camera_worker(connection, settings):
-    """Only request Image2D frames; isolate the vendor's USB teardown."""
+    """Capture grayscale frames; isolate camera SDKs and USB teardown."""
+    camera = None
     try:
-        from jiemian._gray_camera import GrayCamera
-        camera = GrayCamera(settings['device_index'], settings['exposure_gray'], settings['gain'])
-        connection.send(('ready', {'device_index': settings['device_index'], 'capture': 'Image2D callback'}))
+        if settings.get('camera_type', 'shenxiang') == 'realsense_d455':
+            from jiemian.cameras.realsense_gray_camera import RealSenseGrayCamera
+            camera = RealSenseGrayCamera(settings['device_index'])
+            detail = camera.detail
+        else:
+            from jiemian.cameras._gray_camera import GrayCamera
+            camera = GrayCamera(settings['device_index'], settings['exposure_gray'], settings['gain'])
+            detail = dict(camera_type='shenxiang', device_index=settings['device_index'], capture='Image2D callback')
+        connection.send(('ready', detail))
         while True:
             command = connection.recv()
             if command == 'stop':
@@ -71,6 +93,11 @@ def camera_worker(connection, settings):
         except (OSError, EOFError):
             pass
     finally:
+        if camera is not None and settings.get('camera_type') == 'realsense_d455':
+            try:
+                camera.close()
+            except Exception:
+                pass
         connection.close()
         os._exit(0)
 
@@ -131,39 +158,46 @@ class BoardTracker:
             estimator.camera_matrix = calibration_matrix
 
 
-def pose_plot(records, index, axis_length=54.0):
+def pose_plot(records, index, board_id=None, quantity='rotation'):
+    """Plot one board's three relative components, leaving missed frames blank."""
     figure = go.Figure()
-    colors = ['#1f77b4', '#ff7f0e', '#9467bd', '#17becf']
-    current = records[index]['boards'] if records else {}
-    board_ids = sorted({key for record in records[:index + 1] for key in record['boards']})
-    for number, board_id in enumerate(board_ids):
-        # None breaks trajectories when a board was not observed.
-        points = [record['boards'].get(board_id, {}).get('T_camera_board') for record in records[:index + 1]]
-        xyz = [[None] * 3 if value is None else np.asarray(value)[:3, 3].tolist() for value in points]
-        figure.add_trace(go.Scatter3d(x=[p[0] for p in xyz], y=[p[1] for p in xyz], z=[p[2] for p in xyz],
-                                     mode='lines', name=f'板 {board_id} 轨迹', line=dict(color=colors[number % len(colors)])))
-        initial = next(np.asarray(value)[:3, 3] for value in points if value is not None)
-        figure.add_trace(go.Scatter3d(x=[initial[0]], y=[initial[1]], z=[initial[2]],
-                                     mode='markers', marker=dict(symbol='diamond', size=4, color=colors[number % len(colors)]),
-                                     name=f'板 {board_id} 起始点'))
-        if board_id in current:
-            transform = np.asarray(current[board_id]['T_camera_board'])
-            origin = transform[:3, 3]
-            for axis, color in enumerate(['red', 'green', 'blue']):
-                end = origin + transform[:3, axis] * axis_length
-                figure.add_trace(go.Scatter3d(x=[origin[0], end[0]], y=[origin[1], end[1]], z=[origin[2], end[2]],
-                                             mode='lines', line=dict(color=color, width=6),
-                                             name=f'板 {board_id} {"XYZ"[axis]}', showlegend=False))
-    figure.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode='markers', name='固定相机'))
-    figure.update_layout(scene=dict(xaxis_title='相机 X / mm', yaxis_title='相机 Y / mm', zaxis_title='相机 Z / mm', aspectmode='data', uirevision='fixed-camera'),
-                         uirevision='fixed-camera', margin=dict(l=0, r=0, t=20, b=0))
+    board_ids = sorted({key for record in records for key in record['boards']})
+    if board_id not in board_ids:
+        board_id = board_ids[0] if board_ids else None
+    frames = [record['index'] for record in records]
+    values = []
+    for record in records:
+        pose = record['boards'].get(board_id)
+        if pose is None:
+            values.append([None] * 3)
+        elif quantity == 'translation':
+            values.append(pose['translation_mm'])
+        else:
+            angles = pose.get('rotation_euler_xyz_deg')
+            if angles is None:
+                # Older sessions have the relative matrix but no Euler angles.
+                angles = rotation_euler_xyz_deg(np.asarray(pose['T_initial_board'])[:3, :3])
+            values.append(angles)
+    for axis, color in enumerate(('#e74c3c', '#27ae60', '#2980b9')):
+        figure.add_trace(go.Scatter(
+            x=frames, y=[value[axis] for value in values], mode='lines+markers',
+            name=('绕 ' if quantity == 'rotation' else 'Δ') + 'XYZ'[axis],
+            line=dict(color=color), marker=dict(size=4), connectgaps=False))
+    if records:
+        index = max(0, min(index, len(records) - 1))
+        figure.add_vline(x=frames[index], line_dash='dash', line_color='#555555')
+    figure.update_layout(
+        xaxis_title='原始帧序号',
+        yaxis_title='角度 / °' if quantity == 'rotation' else '平移 / mm',
+        hovermode='x unified', uirevision=f'aruco-{quantity}-{board_id}',
+        margin=dict(l=55, r=20, t=25, b=45))
     return figure
 
 
 class PoseController:
     def __init__(self, config_path, output=None):
         self.config = load_config(project_path(config_path))
-        self.output = project_path(output or str(Path(self.config['paths']['save_dir']) / 'aruco_pose'))
+        self.output = project_path(output or self.config['paths']['save_dir'])
         self.context = mp.get_context('spawn')
         self.lock = threading.RLock()
         self.process = self.connection = None
@@ -175,8 +209,16 @@ class PoseController:
         self._display_image = None
         self.continuous = self.playing = False
         self.replay_index = 0
+        self.plot_board_id = None
         self.play_time = self.play_record_time = 0.0
         self.status = '请启动相机并拍摄起始图像。'
+
+    def _create_session(self, camera_type, metadata):
+        session = pose_storage_root(self.output, camera_type) / datetime.now().strftime('pose_%Y%m%d_%H%M%S_%f')
+        (session / 'gray').mkdir(parents=True)
+        (session / 'visual').mkdir()
+        (session / 'session.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+        return session
 
     def _receive(self, timeout, action):
         try:
@@ -209,23 +251,29 @@ class PoseController:
             self.status = '相机已停止；记录已保存，可以回放。'
             return self.render()
 
-    def start(self, device, exposure, gain):
+    def start(self, device, exposure, gain, camera_type='shenxiang'):
         with self.lock:
             try:
-                settings = dict(device_index=int(device), exposure_gray=float(exposure), gain=int(gain))
-                if settings['device_index'] < 0 or not 0.1 <= settings['exposure_gray'] <= 100 or not 0 <= settings['gain'] <= 5:
-                    raise ValueError('设备序号须 ≥ 0，灰度曝光须在 0.1–100，增益须在 0–5')
+                if camera_type not in ('shenxiang', 'realsense_d455'):
+                    raise ValueError('未知相机类型')
+                if int(device) != float(device) or int(device) < 0:
+                    raise ValueError('设备序号须为 ≥ 0 的整数')
+                settings = dict(camera_type=camera_type, device_index=int(device))
+                if camera_type == 'shenxiang':
+                    settings.update(exposure_gray=float(exposure), gain=int(gain))
+                    if not 0.1 <= settings['exposure_gray'] <= 100 or not 0 <= settings['gain'] <= 5:
+                        raise ValueError('灰度曝光须在 0.1–100，增益须在 0–5')
                 self._stop_camera()
                 paths = self.config['paths']
-                estimator = Aruco_pose_Estimater.from_yaml(str(project_path(paths['int_yaml_path'])),
-                    self.config['reconstruction']['aruco_length'],
-                    board_yaml_path=str(project_path(paths['aruco_board_yaml_path'])))
-                self.tracker = BoardTracker(estimator)
-                # Build a workspace-local adapter, leaving the installed SDK unchanged.
-                import importlib.util
-                if importlib.util.find_spec('jiemian._gray_camera') is None:
-                    from jiemian.build_gray_camera import build
-                    build()
+                if camera_type == 'shenxiang':
+                    estimator = Aruco_pose_Estimater.from_yaml(str(project_path(paths['int_yaml_path'])),
+                        self.config['reconstruction']['aruco_length'],
+                        board_yaml_path=str(project_path(paths['aruco_board_yaml_path'])))
+                    # Build a workspace-local adapter, leaving the installed SDK unchanged.
+                    import importlib.util
+                    if importlib.util.find_spec('jiemian.cameras._gray_camera') is None:
+                        from jiemian.cameras.build_gray_camera import build
+                        build()
                 self.connection, child = self.context.Pipe()
                 self.process = self.context.Process(target=camera_worker, args=(child, settings), daemon=True)
                 self.process.start()
@@ -233,18 +281,23 @@ class PoseController:
                 kind, detail = self._receive(20, '启动')
                 if kind != 'ready':
                     raise RuntimeError(str(detail))
-                self.session = self.output / datetime.now().strftime('pose_%Y%m%d_%H%M%S_%f')
-                (self.session / 'gray').mkdir(parents=True)
-                (self.session / 'visual').mkdir()
+                if camera_type == 'realsense_d455':
+                    calibration = detail['calibration']
+                    length, layouts = Aruco_pose_Estimater.load_board_config(str(project_path(paths['aruco_board_yaml_path'])))
+                    estimator = Aruco_pose_Estimater(
+                        calibration['camera_matrix'], calibration['dist_coeffs'],
+                        length if length is not None else self.config['reconstruction']['aruco_length'],
+                        image_size=tuple(calibration['image_size']), board_marker_layouts=layouts)
+                self.tracker = BoardTracker(estimator)
                 self.records = []
                 self.preview = None
                 self._display_key = self._display_image = None
                 self.replay_index = 0
                 self.playing = False
-                metadata = dict(settings=settings, config=self.config, device=str(detail),
+                metadata = dict(settings=settings, config=self.config, device=detail,
                     convention='T_camera_board: board to fixed camera; T_initial_board = inverse(T_camera_board_initial) @ T_camera_board; mm',
                     reference_policy='Each board uses its first valid observation, including boards absent in the starting image.')
-                (self.session / 'session.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+                self.session = self._create_session(camera_type, metadata)
                 self.status = '相机已启动，实时预览中，尚未保存起始图。请点击“拍摄起始图像”建立参考位姿。'
             except Exception as exc:
                 self._stop_camera()
@@ -368,10 +421,7 @@ class PoseController:
                 session = None
                 if self.process is not None:
                     metadata = json.loads((self.session / 'session.json').read_text(encoding='utf-8'))
-                    session = self.output / datetime.now().strftime('pose_%Y%m%d_%H%M%S_%f')
-                    (session / 'gray').mkdir(parents=True)
-                    (session / 'visual').mkdir()
-                    (session / 'session.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+                    session = self._create_session(metadata['settings']['camera_type'], metadata)
                 self.continuous = self.playing = False
                 self.records = []
                 self.replay_index = 0
@@ -409,10 +459,19 @@ class PoseController:
                 if self.replay_index == len(self.records) - 1:
                     self.playing = False
             else:
-                return (*tuple(gr.skip() for _ in range(8)), self.preview if self.process is not None else gr.skip())
+                return (*tuple(gr.skip() for _ in range(8)), self.preview if self.process is not None else gr.skip(),
+                        gr.skip(), gr.skip())
+            return self.render()
+
+    def set_plot_board(self, board_id):
+        with self.lock:
+            self.plot_board_id = board_id
             return self.render()
 
     def render(self):
+        plot_board_ids = sorted({key for item in self.records for key in item['boards']})
+        if self.plot_board_id not in plot_board_ids:
+            self.plot_board_id = plot_board_ids[0] if plot_board_ids else None
         index = self.replay_index
         record = self.records[index] if self.records else None
         image = None
@@ -437,54 +496,65 @@ class PoseController:
                              *pose['translation_mm'], *euler_angles, pose['rotation_angle_deg'], pose['reprojection_error_px']])
             else:
                 rows.append([str(board_id), '本帧未检测', None, 0, *([None] * 8)])
-        return (image, rows, record or {}, pose_plot(self.records, index).to_json(),
+        return (image, rows, record or {}, pose_plot(self.records, index, self.plot_board_id).to_json(),
                 gr.update(value=index, maximum=max(1, len(self.records) - 1)),
-                self.status + (f'\n会话：{self.session}' if self.session else ''), self.continuous, self.playing, self.preview)
+                self.status + (f'\n会话：{self.session}' if self.session else ''), self.continuous, self.playing, self.preview,
+                pose_plot(self.records, index, self.plot_board_id, 'translation').to_json(),
+                gr.update(choices=plot_board_ids, value=self.plot_board_id))
 
 
 def build_ui(controller):
     plotly_asset = Path(plotly.__file__).parent / 'package_data/plotly.min.js'
     gr.set_static_paths(paths=[plotly_asset])
+    plot_script = (Path(__file__).parent / 'assets/persistent_pose_plot.js').read_text(encoding='utf-8')
+
+    def persistent_plot(value, label, elem_id):
+        return gr.HTML(
+            value=value.to_json(), label=label, show_label=True, container=True,
+            html_template='<div class="pose-graph" style="width:100%;height:440px"></div>',
+            apply_default_css=False,
+            head=f'<script src="/gradio_api/file={quote(str(plotly_asset.resolve()))}"></script>',
+            js_on_load=plot_script, elem_id=elem_id)
+
     with gr.Blocks(title='ArUco 实时位姿估计') as ui:
         gr.Markdown('## ArUco 实时位姿估计\n固定相机、移动板子；纯灰度、全分辨率。每块板独立以首次有效观测为起点。平移单位 mm，各轴欧拉角和总体旋转角单位 °。')
         with gr.Row():
+            camera_type = gr.Dropdown(label='相机类型', choices=[('盛相相机', 'shenxiang'), ('RealSense D455', 'realsense_d455')], value='shenxiang')
             device = gr.Number(label='设备序号', value=0, precision=0)
             exposure = gr.Number(label='灰度曝光（0.1–100）', value=100)
             gain = gr.Number(label='增益（0–5）', value=0, precision=0)
         with gr.Row():
-            start = gr.Button('启动相机', variant='primary')
+            start = gr.Button('启动 / 切换相机', variant='primary')
             initial = gr.Button('拍摄起始图像', variant='primary')
             capture = gr.Button('单帧检测')
             continuous = gr.Checkbox(label='连续视频检测', value=False)
             stop = gr.Button('停止相机')
         status = gr.Textbox(label='状态 / 保存目录', interactive=False)
+        gr.Markdown('选择相机类型及设备序号后，点击“启动 / 切换相机”。切换会创建新会话，需重新拍摄起始图像，已保存文件保留。D455 使用 1280×720 彩色流转灰度、设备自带标定和自动曝光；设备序号按 D455 序列号排序。')
         preview = gr.Image(label='实时灰度预览（不保存、不建立参考位姿）', type='numpy', image_mode='L')
+        image = gr.Image(label='灰度检测与各板坐标轴', type='numpy')
+        plot_board = gr.Dropdown(label='位姿曲线：板 ID', choices=[], value=None)
         with gr.Row():
-            image = gr.Image(label='灰度检测与各板坐标轴', type='numpy')
-            plot = gr.HTML(
-                value=pose_plot([], 0).to_json(),
-                label='固定相机坐标系中的轨迹与姿态（红 X / 绿 Y / 蓝 Z）',
-                show_label=True, container=True,
-                html_template='<div class="pose-graph" style="width:100%;height:480px"></div>',
-                apply_default_css=False,
-                head=f'<script src="/gradio_api/file={quote(str(plotly_asset.resolve()))}"></script>',
-                js_on_load=(Path(__file__).parent / 'assets/persistent_pose_plot.js').read_text(encoding='utf-8'),
-                elem_id='aruco-pose-plot',
-            )
+            plot = persistent_plot(pose_plot([], 0), '历史旋转角：X / Y / Z（°）', 'aruco-rotation-history')
+            translation_plot = persistent_plot(pose_plot([], 0, quantity='translation'),
+                                               '历史平移：X / Y / Z（mm）', 'aruco-translation-history')
         table = gr.Dataframe(headers=['板 ID', '状态', '起始帧', '码数', 'ΔX', 'ΔY', 'ΔZ', '绕 X 角度 (°)', '绕 Y 角度 (°)', '绕 Z 角度 (°)', '总体旋转角 (°)', '重投影误差 px'], interactive=False)
-        gr.Markdown('平移和旋转均表示当前板子相对自身起始坐标系的变化。三轴角度采用固定轴 XYZ 欧拉角：依次绕起始 X、Y、Z 轴旋转，R = Rz · Ry · Rx；X/Z 范围 ±180°，Y 范围 ±90°，Y 为 ±90° 时约定 Z = 0°。总体旋转角是相对起始姿态的最小等效旋转角（0–180°），不是三轴角度之和或累计转角。3D 图使用固定相机坐标系；漏检帧留空。')
+        gr.Markdown('平移和旋转均表示当前板子相对自身起始坐标系的变化。三轴角度采用固定轴 XYZ 欧拉角：依次绕起始 X、Y、Z 轴旋转，R = Rz · Ry · Rx；X/Z 范围 ±180°，Y 范围 ±90°，Y 为 ±90° 时约定 Z = 0°。总体旋转角是相对起始姿态的最小等效旋转角（0–180°），不是三轴角度之和或累计转角。两张折线图分别显示所选板的三轴欧拉角和平移，虚线标记当前回放帧；漏检帧留空。')
         with gr.Row():
             slider = gr.Slider(label='回放帧（0 为起始图像）', minimum=0, maximum=1, step=1, value=0)
             playing = gr.Checkbox(label='自动回放（按原始时间）', value=False)
         with gr.Row():
-            folder = gr.Textbox(label='历史会话目录', placeholder='depth_outputs/.../aruco_pose/pose_...')
+            folder = gr.Textbox(label='历史会话目录', placeholder='depth_outputs/shengxiang_pose/continuous/pose_...')
             load = gr.Button('载入历史会话')
         with gr.Accordion('本帧完整位姿与变换矩阵', open=False):
             detail = gr.JSON()
         clear = gr.Button('清空历史')
-        outputs = [image, table, detail, plot, slider, status, continuous, playing, preview]
+        outputs = [image, table, detail, plot, slider, status, continuous, playing, preview, translation_plot, plot_board]
         events = dict(outputs=outputs, concurrency_id='pose-controller', concurrency_limit=1)
-        start.click(controller.start, inputs=[device, exposure, gain], **events)
+        camera_type.change(lambda value: (gr.update(visible=value == 'shenxiang'), gr.update(visible=value == 'shenxiang')),
+                           inputs=[camera_type], outputs=[exposure, gain])
+        plot_board.input(controller.set_plot_board, inputs=[plot_board], **events)
+        start.click(controller.start, inputs=[device, exposure, gain, camera_type], **events)
         initial.click(controller.capture_initial, **events)
         capture.click(controller.capture, **events)
         stop.click(controller.stop, **events)
@@ -500,13 +570,14 @@ def build_ui(controller):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='config/recon/shenxiang.yaml')
-    parser.add_argument('--output', help='灰度图、标注图和位姿记录保存根目录')
+    parser.add_argument('--output', help='保存根目录，自动按 shengxiang_pose / realsense_pose 分目录')
     parser.add_argument('--port', type=int, default=7861)
     args = parser.parse_args()
     controller = PoseController(args.config, args.output)
     try:
         build_ui(controller).queue().launch(server_name='127.0.0.1', server_port=args.port,
-                                           allowed_paths=[str(controller.output.resolve())])
+                                           allowed_paths=[str(pose_storage_root(controller.output, camera).resolve())
+                                                          for camera in ('shenxiang', 'realsense_d455')])
     finally:
         controller.stop()
 

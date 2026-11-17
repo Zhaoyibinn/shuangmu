@@ -10,6 +10,7 @@ import importlib.util
 import torch
 import numpy as np
 import cv2
+from time import perf_counter
 from typing import Optional, Dict
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -89,7 +90,9 @@ class FastStereoInference:
               left_img_bgr: np.ndarray,
               right_img_bgr: np.ndarray,
               K_rect: np.ndarray,
-              baseline_m: float) -> Dict[str, np.ndarray]:
+              baseline_m: float,
+              valid_iters: Optional[int] = None,
+              timings: Optional[Dict[str, float]] = None) -> Dict[str, np.ndarray]:
         """
         对已极线校正的双目图像对进行立体匹配推理。
 
@@ -98,12 +101,30 @@ class FastStereoInference:
             right_img_bgr: 右图（BGR 或灰度），uint8，(H, W, 3) 或 (H, W)
             K_rect: 校正后的相机内参矩阵 (3, 3)
             baseline_m: 基线距离（米，正数）
+            valid_iters: 可选的本次推理迭代次数
+            timings: 可选输出字典，记录 CUDA 同步后的各环节毫秒耗时
 
         Returns:
             字典，包含:
                 - 'disparity': 视差图 (H, W)，float32，单位像素
                 - 'depth'    : 深度图 (H, W)，float32，单位米
         """
+        def boundary():
+            torch.cuda.synchronize(self.device)
+            return perf_counter()
+
+        started = previous = boundary() if timings is not None else 0.
+
+        def mark(name):
+            nonlocal previous
+            if timings is not None:
+                now = boundary()
+                timings[name] = (now - previous) * 1000.
+                previous = now
+
+        iterations = self.model.args.valid_iters if valid_iters is None else int(valid_iters)
+        if iterations < 1:
+            raise ValueError('推理迭代次数必须 ≥ 1')
         assert left_img_bgr.shape == right_img_bgr.shape, "左右图尺寸必须一致"
         assert K_rect.shape == (3, 3), "K_rect 必须为 (3, 3)"
         assert baseline_m > 0, "基线距离必须为正数"
@@ -124,22 +145,30 @@ class FastStereoInference:
         padder = _load_input_padder()(img0_t.shape, divis_by=32, force_square=False)
         img0_t, img1_t = padder.pad(img0_t, img1_t)
 
+        mark('input_convert_upload_pad')
         with torch.no_grad(), torch.amp.autocast('cuda', enabled=True, dtype=AMP_DTYPE):
             disp = self.model.forward(img0_t, img1_t,
-                                      iters=self.model.args.valid_iters,
+                                      iters=iterations,
                                       test_mode=True,
                                       optimize_build_volume='pytorch1')
 
+        mark('network_forward')
         disp = padder.unpad(disp.float())
         disp_np = disp.data.cpu().numpy().reshape(H, W).clip(0, None)
 
+        mark('unpad_download')
         # 由视差计算深度
         fx = float(K_rect[0, 0])
         valid_mask = disp_np > 0
         depth = np.zeros_like(disp_np)
         depth[valid_mask] = fx * baseline_m / disp_np[valid_mask]
 
+        mark('disparity_to_depth')
+        if timings is not None:
+            timings['total_ms'] = (perf_counter() - started) * 1000.
+
         return {
             'disparity': disp_np,
             'depth': depth,
+            'valid_mask': valid_mask,
         }

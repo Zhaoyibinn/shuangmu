@@ -8,6 +8,30 @@ import yaml
 import os
 
 
+def project_depth_to_rgb(depth, source_k, rotation, translation, rgb_k, rgb_size):
+    """Project pinhole depth to RGB, retaining the nearest target-camera Z.
+
+    ``rotation @ source_point + translation`` maps source to RGB coordinates.
+    Depth and translation must use the same length unit; output keeps that unit.
+    Both images must already be undistorted. Unobserved pixels remain zero.
+    """
+    v, u = np.nonzero(np.isfinite(depth) & (depth > 0))
+    z = depth[v, u].astype(np.float64)
+    points = np.stack(((u - source_k[0, 2]) * z / source_k[0, 0],
+                       (v - source_k[1, 2]) * z / source_k[1, 1], z))
+    points = rotation @ points + np.asarray(translation).reshape(3, 1)
+    good = np.isfinite(points).all(axis=0) & (points[2] > 0)
+    points = points[:, good]
+    width, height = rgb_size
+    x = np.rint(rgb_k[0, 0] * points[0] / points[2] + rgb_k[0, 2]).astype(np.int64)
+    y = np.rint(rgb_k[1, 1] * points[1] / points[2] + rgb_k[1, 2]).astype(np.int64)
+    inside = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+    buffer = np.full(height * width, np.inf)
+    # Occlusion: keep the nearest RGB-camera Z when multiple samples hit a pixel.
+    np.minimum.at(buffer, y[inside] * width + x[inside], points[2, inside])
+    return np.where(np.isfinite(buffer), buffer, 0).reshape(height, width).astype(np.float32)
+
+
 class ColorMapper:
     """RGB颜色映射器 - 将深度图染色为RGBD"""
 
@@ -66,65 +90,9 @@ class ColorMapper:
         # if self.K_RGB is None or self.R_L2RGB is None or self.t_L2RGB is None:
         #     raise ValueError('RGB calibration is not loaded, call load_calibration() first')
 
-        H, W = depth_L.shape
         h_c, w_c = rgb_img.shape[:2]
-        # 初始化RGBD（float32存储，方便D通道）
         rgbd = np.zeros((h_c, w_c, 4), dtype=np.float32)
         rgbd[:, :, :3] = rgb_img.astype(np.float32)
-
-        # 有效深度掩码
-        valid = depth_L > 0
-        if not np.any(valid):
-            return rgbd
-
-        # 像素坐标网格
-        u, v = np.meshgrid(np.arange(W), np.arange(H))
-        u_valid = u[valid].astype(np.float32)
-        v_valid = v[valid].astype(np.float32)
-        Z = depth_L[valid]
-
-        # Step 1: 反投影 (左目像素+深度 → 左目3D)
-        fx_L, fy_L = K_L[0, 0], K_L[1, 1]
-        cx_L, cy_L = K_L[0, 2], K_L[1, 2]
-        X_L = (u_valid - cx_L) * Z / fx_L
-        Y_L = (v_valid - cy_L) * Z / fy_L
-        pts_L = np.stack([X_L, Y_L, Z], axis=0)  # 3xN
-
-        # Step 2: 坐标变换 (左目3D → RGB相机3D)
-        pts_C = self.R_L2RGB @ pts_L + self.t_L2RGB
-        X_C, Y_C, Z_C = pts_C
-
-        # Step 3: 投影 (RGB相机3D → RGB像素)
-        fx_C, fy_C = self.K_RGB[0, 0], self.K_RGB[1, 1]
-        cx_C, cy_C = self.K_RGB[0, 2], self.K_RGB[1, 2]
-
-        # 过滤Z_C <= 0的点
-        valid_z = Z_C > 0
-        u_C = np.full_like(X_C, -1)
-        v_C = np.full_like(Y_C, -1)
-        u_C[valid_z] = fx_C * X_C[valid_z] / Z_C[valid_z] + cx_C
-        v_C[valid_z] = fy_C * Y_C[valid_z] / Z_C[valid_z] + cy_C
-
-        # 边界检查（深度对齐到RGB像素）
-        u_C_round = np.round(u_C).astype(np.int32)
-        v_C_round = np.round(v_C).astype(np.int32)
-        inside = valid_z & (u_C_round >= 0) & (u_C_round < w_c) & (v_C_round >= 0) & (v_C_round < h_c)
-
-        if not np.any(inside):
-            return rgbd
-
-        # 深度写入RGB像素（使用Z_C作为RGB相机坐标系深度）
-        u_in = u_C_round[inside]
-        v_in = v_C_round[inside]
-        z_in = Z_C[inside]
-
-        depth_rgb = np.full((h_c, w_c), np.inf, dtype=np.float32)
-        flat_idx = v_in * w_c + u_in
-        depth_flat = depth_rgb.reshape(-1)
-        np.minimum.at(depth_flat, flat_idx, z_in)
-        depth_rgb = depth_flat.reshape(h_c, w_c)
-        depth_rgb[~np.isfinite(depth_rgb)] = 0
-
-        rgbd[:, :, 3] = depth_rgb
-
+        rgbd[:, :, 3] = project_depth_to_rgb(
+            depth_L, K_L, self.R_L2RGB, self.t_L2RGB, self.K_RGB, (w_c, h_c))
         return rgbd

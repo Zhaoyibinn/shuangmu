@@ -19,9 +19,10 @@ class Aruco_pose_Estimater(object):
         self.aruco_dict = cv2.aruco.getPredefinedDictionary(aruco_dict)
         params = cv2.aruco.DetectorParameters()
 
-        # params.adaptiveThreshWinSizeMin = 3
-        # params.adaptiveThreshWinSizeMax = 53
-        # params.adaptiveThreshWinSizeStep = 4
+        # Try more local threshold scales for small, oblique markers.
+        params.adaptiveThreshWinSizeMin = 3
+        params.adaptiveThreshWinSizeMax = 43
+        params.adaptiveThreshWinSizeStep = 4
         # params.minMarkerPerimeterRate = 0.01
         # params.maxMarkerPerimeterRate = 4.0
         # params.polygonalApproxAccuracyRate = 0.06
@@ -610,12 +611,11 @@ class Aruco_pose_Estimater(object):
 
         self.collect_joint_calibration_frames(marker_poses)
 
-        preferred_board_id = self.choose_best_marker_pose(marker_poses)
-        if (
-            preferred_board_id is not None
-            and preferred_board_id not in self.marker_to_anchor_transforms
-        ):
-            self.jointly_calibrate_board(preferred_board_id)
+        # Register every jointly observed board as soon as enough frames exist,
+        # even while the anchor remains the largest visible board.
+        for candidate_board_id in marker_poses:
+            if candidate_board_id not in self.marker_to_anchor_transforms:
+                self.jointly_calibrate_board(candidate_board_id)
 
         visible_known_marker_ids = [marker_id for marker_id in marker_poses if marker_id in self.marker_to_anchor_transforms]
         if not visible_known_marker_ids:
@@ -719,6 +719,7 @@ class Aruco_pose_Estimater(object):
 
         world_pose['corners'] = corners
         world_pose['ids'] = ids
+        world_pose['board_poses'] = marker_poses
         return world_pose
 
     def draw_pose_visualization(self, frame, pose, frame_idx):
@@ -751,14 +752,17 @@ class Aruco_pose_Estimater(object):
             return vis_frame
 
         cv2.aruco.drawDetectedMarkers(vis_frame, pose['corners'], pose['ids'])
-        cv2.drawFrameAxes(
-            vis_frame,
-            self.camera_matrix,
-            self.dist_coeffs,
-            pose['rvec_obj_to_cam'],
-            pose['tvec_obj_to_cam'],
-            pose['axis_length'],
-        )
+        board_poses = pose.get('board_poses', {pose['board_id']: pose})
+        for board_id, board_pose in board_poses.items():
+            cv2.drawFrameAxes(
+                vis_frame, self.camera_matrix, self.dist_coeffs,
+                board_pose['rvec_obj_to_cam'], board_pose['tvec_obj_to_cam'], board_pose['axis_length'])
+            center = np.asarray(board_pose['image_points']).reshape(-1, 2).mean(axis=0)
+            registered = board_id in self.marker_to_anchor_transforms
+            label = 'Board {} {}{}'.format(board_id, 'registered' if registered else 'pending',
+                                           ' REF' if board_id == pose['reference_board_id'] else '')
+            cv2.putText(vis_frame, label, tuple(np.rint(center).astype(int)),
+                        cv2.FONT_HERSHEY_SIMPLEX, .6, (0, 255, 0) if registered else (0, 165, 255), 2)
 
         cam_t = pose.get('translation_cam_to_world', pose['translation_cam_to_obj']).reshape(-1)
         text_lines = [

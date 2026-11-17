@@ -1,4 +1,4 @@
-"""Live Shengxiang camera capture and one-frame-at-a-time reconstruction UI."""
+"""Live Shengxiang / RealSense D455 capture and one-frame-at-a-time reconstruction UI."""
 
 import argparse
 import json
@@ -8,6 +8,7 @@ from pathlib import Path
 from queue import Empty, Full
 import sys
 import threading
+from time import perf_counter
 from datetime import datetime
 
 import cv2
@@ -21,13 +22,33 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from Recon.timing import StageTimer, timing_summary
 from Recon.Reconstruction import Reconstruction
 from Recon.config_loader import load_config
+from jiemian.cameras.realsense_stereo_camera import STEREO_METHODS, default_checkpoint
+from jiemian.processing.foreground import DEFAULT_YOLO
 
 
 def _project_path(value):
     path = Path(value)
     return path if path.is_absolute() else ROOT / path
+
+
+def _camera_storage_root(value, camera_type):
+    """Keep existing camera directory layouts; scope custom roots by camera."""
+    camera_folders = {'shengxiang': 'shengxiang', 'realsense_d455': 'realsense'}
+    if camera_type not in camera_folders:
+        raise ValueError('不支持的相机类型')
+    folder = camera_folders[camera_type]
+    root = _project_path(value)
+    parts = list(root.parts)
+    aliases = {'shengxiang', 'shenxiang', 'realsense', 'realsense_d455'}
+    # Replace the nearest camera directory, preserving suffixes such as continuous.
+    for index in range(len(parts) - 1, 0, -1):
+        if parts[index] in aliases:
+            parts[index] = folder
+            return Path(*parts)
+    return root / folder
 
 
 def _camera_settings(device_index, binning, working_mode, exposure_mode,
@@ -112,6 +133,10 @@ def _camera_worker(frame_queue, status_pipe, stop_event, settings):
     try:
         from mpsizector import Camera, DataOutMode, ExposureMode, WorkingMode
 
+        from jiemian.processing.foreground import ForegroundSegmenter
+        foreground_settings = settings['foreground']
+        segmenter = ForegroundSegmenter(**{
+            key: foreground_settings[key] for key in ('weights', 'conf', 'imgsz', 'device')})
         camera = Camera()
         camera.open(settings['device_index'])
         camera.set_binning(settings['binning'])
@@ -132,11 +157,25 @@ def _camera_worker(frame_queue, status_pipe, stop_event, settings):
         status_pipe.send(('ready', camera.current_device()))
         sequence = 0
         while not stop_event.is_set():
+            timer = StageTimer()
             frame = camera.get_latest_zmap_frame(timeout_ms=1000)
             if frame is None:
                 continue
+            timer.mark('wait_for_frames')
+            depth, gray, sdk_mask = frame[:3]
+            foreground = segmenter.segment(cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR))
+            timer.mark('foreground_segment')
+            # Retain SDK invalid flags, and mark background as invalid for reconstruction.
+            mask = np.asarray(sdk_mask, dtype=np.uint8).copy()
+            mask[~foreground] |= 1
+            aligned = np.where(((sdk_mask & 0x07) == 0) & np.isfinite(depth) & (depth > 0), depth, 0)
+            extra = dict(foreground=foreground.astype(np.uint8) * 255, aligned_depth_mm=aligned)
+            timer.mark('mask_pack')
+            extra['timings_ms'] = timer.finish()
+            extra['produced_at'] = perf_counter()
             sequence += 1
-            item = (sequence, frame[0], frame[1], frame[2])
+            print(f'[Shengxiang frame {sequence}] {timing_summary(extra["timings_ms"])}', flush=True)
+            item = (sequence, depth, gray, mask, None, extra)
             try:
                 frame_queue.put_nowait(item)
             except Full:
@@ -160,12 +199,49 @@ def _camera_worker(frame_queue, status_pipe, stop_event, settings):
         os._exit(0)
 
 
+def _realsense_worker(frame_queue, status_pipe, stop_event, settings):
+    from jiemian.cameras.realsense_stereo_camera import RealSenseStereoCamera
+    camera = None
+    try:
+        camera = RealSenseStereoCamera(settings['device_index'], settings['checkpoint'], settings['valid_iters'], settings.get('foreground'), settings['stereo_method'])
+        status_pipe.send(('ready', camera.detail))
+        sequence = 0
+        while not stop_event.is_set():
+            depth, left, mask, right, extra = camera.capture()
+            sequence += 1
+            print(f'[RealSense frame {sequence}] {timing_summary(extra["timings_ms"])}', flush=True)
+            print(f'[{settings["stereo_method"]} frame {sequence}] {timing_summary(extra["stereo_timings_ms"])}', flush=True)
+            item = (sequence, depth, left, mask, right, extra)
+            try:
+                frame_queue.put_nowait(item)
+            except Full:
+                try:
+                    frame_queue.get_nowait()
+                except Empty:
+                    pass
+                try:
+                    frame_queue.put_nowait(item)
+                except Full:
+                    pass
+    except Exception as exc:
+        try:
+            status_pipe.send(('error', str(exc)))
+        except (BrokenPipeError, OSError):
+            pass
+    finally:
+        try:
+            if camera is not None:
+                camera.close()
+        finally:
+            status_pipe.close()
+
+
 def _prepare_frame(raw_frame, image_size, min_depth, max_depth):
-    sequence, depth_mm, gray, sdk_mask = raw_frame
+    sequence, depth_mm, gray, sdk_mask = raw_frame[:4]
     if depth_mm.shape != gray.shape or gray.shape != sdk_mask.shape:
         raise ValueError('相机的深度、灰度和 mask 尺寸不一致')
     valid = ((sdk_mask & 0x07) == 0) & np.isfinite(depth_mm)
-    valid &= (depth_mm >= min_depth) & (depth_mm <= max_depth)
+    valid &= (depth_mm > 0) & (depth_mm >= min_depth) & (depth_mm <= min(max_depth, 65535))
     depth = np.zeros(depth_mm.shape, dtype=np.uint16)
     depth[valid] = np.rint(depth_mm[valid]).astype(np.uint16)
     mask = valid.astype(np.uint8) * 255
@@ -197,9 +273,29 @@ def _raw_depth_stats(depth_mm, sdk_mask, min_depth, max_depth):
     }
 
 
+def _unsegmented_depth(raw_frame, image_size):
+    """Use sensor-valid depth before foreground masking, in calibrated pixels."""
+    extra = raw_frame[5] if len(raw_frame) > 5 else {}
+    if 'aligned_depth_mm' in extra:
+        # Both camera workers retain valid, unsegmented depth here. Their
+        # outgoing SDK mask already includes foreground rejection flags.
+        depth = np.asarray(extra['aligned_depth_mm'], dtype=np.float64)
+        valid = np.isfinite(depth) & (depth > 0)
+    else:
+        depth = np.asarray(raw_frame[1], dtype=np.float64)
+        valid = np.isfinite(depth) & (depth > 0) & ((raw_frame[3] & 0x07) == 0)
+    depth = np.where(valid, depth, 0)
+    if (depth.shape[1], depth.shape[0]) != image_size:
+        depth = cv2.resize(depth, image_size, interpolation=cv2.INTER_NEAREST)
+    return depth
+
+
 def _aruco_summary(frame, pose, estimator):
-    _, detected_ids, _ = estimator.detector.detectMarkers(frame)
+    corners, detected_ids, _ = estimator.detector.detectMarkers(frame)
     marker_ids = set() if detected_ids is None else {int(value) for value in detected_ids.ravel()}
+    board_poses = pose.get('board_poses') if pose is not None else None
+    if board_poses is None:
+        board_poses = estimator.estimate_board_poses(corners, detected_ids)
     registered = {int(board_id) for board_id in estimator.marker_to_anchor_transforms}
     boards = []
     for board_id, layout in sorted(estimator.board_marker_layouts.items()):
@@ -210,6 +306,12 @@ def _aruco_summary(frame, pose, estimator):
                 '检测到的码数': len(visible_ids),
                 '码 ID': visible_ids,
                 '已注册到全局坐标系': int(board_id) in registered,
+                '本帧位姿解算成功': board_id in board_poses,
+                '共同观测所需码数': estimator.minimum_markers_for_joint_calibration(board_id),
+                '本帧码数满足板间标定': len(visible_ids) >= estimator.minimum_markers_for_joint_calibration(board_id),
+                '已累计共同观测帧数': max((len(frames) for (reference, candidate), frames
+                    in estimator.board_calibration_frames.items() if candidate == board_id), default=0),
+                '共同观测所需帧数': estimator.MIN_JOINT_CALIBRATION_FRAMES,
             })
     if pose is not None:
         status = '已得到世界位姿'
@@ -222,6 +324,10 @@ def _aruco_summary(frame, pose, estimator):
     summary = {
         '位姿状态': status,
         '检测到的码总数': len(marker_ids),
+        '检测到的码 ID': sorted(marker_ids),
+        '未配置的码 ID': sorted(marker_ids - {int(marker_id) for layout in estimator.board_marker_layouts.values() for marker_id in layout}),
+        '重复码 ID': [] if detected_ids is None else [int(marker_id) for marker_id, count in zip(*np.unique(detected_ids, return_counts=True)) if count > 1],
+        '注册板子 ID': sorted(registered),
         '检测到的板子数': len(boards),
         '板子': boards,
         '锚点板子 ID': None if estimator.anchor_marker_id is None else int(estimator.anchor_marker_id),
@@ -233,12 +339,18 @@ def _aruco_summary(frame, pose, estimator):
     return summary
 
 
-def _depth_preview(depth):
-    valid = depth[depth > 0]
+def _depth_color_range(depth):
+    valid = depth[np.isfinite(depth) & (depth > 0)]
+    if not valid.size:
+        return None
+    low, high = np.percentile(valid, (2, 98))
+    return low, max(high, low + 1)
+
+
+def _depth_preview(depth, color_range):
     scaled = np.zeros(depth.shape, dtype=np.uint8)
-    if valid.size:
-        low, high = np.percentile(valid, (2, 98))
-        high = max(high, low + 1)
+    if color_range is not None:
+        low, high = color_range
         scaled = np.clip((depth.astype(np.float32) - low) * 255 / (high - low), 0, 255).astype(np.uint8)
     color = cv2.cvtColor(cv2.applyColorMap(scaled, cv2.COLORMAP_TURBO), cv2.COLOR_BGR2RGB)
     color[depth == 0] = 0
@@ -246,7 +358,9 @@ def _depth_preview(depth):
 
 
 class LiveReconstruction:
-    def __init__(self, config_path, device_index=0, exposure_3d=100.0):
+    def __init__(self, config_path, device_index=0, exposure_3d=100.0,
+                 camera_type='shengxiang', checkpoint=None, valid_iters=None, foreground_settings=None,
+                 stereo_method='foundation_stereo'):
         self.config_path = _project_path(config_path)
         self.config = load_config(self.config_path)
         if self.config['reconstruction']['input_mode'] != 'direct_depth':
@@ -257,6 +371,19 @@ class LiveReconstruction:
             device_index, True, 'super_precise_3d', 'manual',
             exposure_3d, 30.0, 3, 1, 3, 90,
         )
+        if camera_type not in {'shengxiang', 'realsense_d455'}:
+            raise ValueError('不支持的相机类型')
+        checkpoint = checkpoint or default_checkpoint(stereo_method)
+        valid_iters = valid_iters if valid_iters is not None else (8 if stereo_method == 'fast_foundation_stereo' else 32)
+        self.camera_settings.update(camera_type=camera_type, checkpoint=str(checkpoint),
+                                    valid_iters=int(valid_iters), stereo_method=stereo_method,
+                                    aruco_board_yaml_path=self.config['paths']['aruco_board_yaml_path'])
+        seg = self.config['segmentation']
+        self.camera_settings['foreground'] = foreground_settings or dict(
+            enabled=True,
+            weights=seg['yolo_model_path'] or DEFAULT_YOLO, conf=seg['yolo_conf'],
+            imgsz=seg['yolo_imgsz'], device=seg['yolo_device'])
+        self.camera_settings['foreground']['enabled'] = True
         recon_config = self.config['reconstruction']
         graph_config = self.config['global_registration']['pose_graph']
         self.software_settings = _software_settings(
@@ -272,18 +399,10 @@ class LiveReconstruction:
             graph_config['edge_prune_threshold'],
             graph_config['reference_node'],
         )
-        intrinsics_path = _project_path(self.config['paths']['int_yaml_path'])
-        storage = cv2.FileStorage(str(intrinsics_path), cv2.FILE_STORAGE_READ)
-        try:
-            matrix = storage.getNode('M1').mat()
-            width = int(storage.getNode('image_width').real())
-            height = int(storage.getNode('image_height').real())
-        finally:
-            storage.release()
-        if matrix is None or np.asarray(matrix).shape != (3, 3) or width <= 0 or height <= 0:
-            raise ValueError(f'标定文件缺少 M1/image_width/image_height: {intrinsics_path}')
-        self.camera_matrix = np.asarray(matrix, dtype=np.float64)
-        self.image_size = (width, height)
+        self.camera_matrix = None
+        self.image_size = None
+        if camera_type == 'shengxiang':
+            self._load_shengxiang_calibration()
         self.lock = threading.RLock()
         self.context = mp.get_context('spawn')
         self.process = None
@@ -298,30 +417,66 @@ class LiveReconstruction:
         self.raw_dir = None
         self.output_dir = None
         self.captured_count = 0
+        self.continuous_capture = False
+        self.capture_interval = 0.0
+        self.next_capture_at = 0.0
         self.global_display_path = None
+        self.full_global_cloud = o3d.geometry.PointCloud()
+        self.full_global_display_path = None
         self.pose_summaries = {}
         self.message = '未启动'
+
+    def _load_shengxiang_calibration(self):
+        intrinsics_path = _project_path(self.config['paths']['int_yaml_path'])
+        storage = cv2.FileStorage(str(intrinsics_path), cv2.FILE_STORAGE_READ)
+        try:
+            matrix = storage.getNode('M1').mat()
+            width = int(storage.getNode('image_width').real())
+            height = int(storage.getNode('image_height').real())
+        finally:
+            storage.release()
+        if matrix is None or np.asarray(matrix).shape != (3, 3) or width <= 0 or height <= 0:
+            raise ValueError(f'标定文件缺少 M1/image_width/image_height: {intrinsics_path}')
+        self.camera_matrix = np.asarray(matrix, dtype=np.float64)
+        self.image_size = (width, height)
 
     def _drain_frames(self):
         if self.frame_queue is None:
             return
-        while True:
+        timer = StageTimer()
+        raw_frame = None
+        # Bound queue draining so a fast producer cannot keep this callback busy.
+        # The camera queue holds at most two frames; prepare only the latest one.
+        for _ in range(2):
             try:
                 raw_frame = self.frame_queue.get_nowait()
             except Empty:
                 break
-            self.latest_raw = raw_frame
-            self.latest_stats = _raw_depth_stats(
-                raw_frame[1], raw_frame[3],
-                float(self.config['reconstruction']['depth_range_mm']['min']),
-                float(self.config['reconstruction']['depth_range_mm']['max']),
-            )
-            self.latest = _prepare_frame(
-                raw_frame,
-                self.image_size,
-                float(self.config['reconstruction']['depth_range_mm']['min']),
-                float(self.config['reconstruction']['depth_range_mm']['max']),
-            )
+        if raw_frame is None:
+            return
+        timer.mark('queue_get_deserialize')
+        self.latest_raw = raw_frame
+        extra = raw_frame[5] if len(raw_frame) > 5 else {}
+        if 'produced_at' in extra:
+            extra['delivery_age_ms'] = (perf_counter() - extra['produced_at']) * 1000.
+        self.latest_stats = _raw_depth_stats(
+            raw_frame[1], raw_frame[3],
+            float(self.config['reconstruction']['depth_range_mm']['min']),
+            float(self.config['reconstruction']['depth_range_mm']['max']),
+        )
+        timer.mark('depth_stats')
+        self.latest = _prepare_frame(
+            raw_frame,
+            self.image_size,
+            float(self.config['reconstruction']['depth_range_mm']['min']),
+            float(self.config['reconstruction']['depth_range_mm']['max']),
+        )
+
+        timer.mark('prepare_frame')
+        extra['receive_timings_ms'] = timer.finish()
+        if 'timings_ms' in extra:
+            print(f'[Receive frame {raw_frame[0]}] {timing_summary(extra["receive_timings_ms"])}; '
+                  f'delivery_age={extra["delivery_age_ms"]:.1f} ms', flush=True)
 
     def _status(self):
         diagnostics = ''
@@ -330,10 +485,18 @@ class LiveReconstruction:
             raw_min = '无' if stats['raw_min_mm'] is None else f'{stats["raw_min_mm"]:.0f} mm'
             sdk_min = '无' if stats['sdk_valid_min_mm'] is None else f'{stats["sdk_valid_min_mm"]:.0f} mm'
             diagnostics = (
-                f'｜原始最近深度：{raw_min}；SDK 有效最近深度：{sdk_min}'
+                f'｜原始最近深度：{raw_min}；有效最近深度：{sdk_min}'
                 f'；低于软件下限：{stats["raw_below_min_count"]} 像素'
             )
-        return f'{self.message}｜已拍摄 {self.captured_count} 帧{diagnostics}｜输出：{self.output_dir or "未创建"}'
+        if self.latest_raw is not None and len(self.latest_raw) > 5:
+            timings = self.latest_raw[5].get('timings_ms', {})
+            if timings:
+                total = timings['total_ms']
+                slowest = max((k for k in timings if k != 'total_ms'), key=timings.get)
+                diagnostics += (f'｜采集处理：{total:.0f} ms（{1000. / total:.2f} FPS）'
+                                f'；最慢：{slowest} {timings[slowest]:.0f} ms')
+        mode = '｜连续拍摄中' if self.continuous_capture else ''
+        return f'{self.message}{mode}｜已拍摄 {self.captured_count} 帧{diagnostics}｜输出：{self.output_dir or "未创建"}'
 
     def start(self, settings=None, software_settings=None):
         try:
@@ -348,13 +511,13 @@ class LiveReconstruction:
         self.status_pipe = parent_pipe
         self.stop_event = self.context.Event()
         self.process = self.context.Process(
-            target=_camera_worker,
+            target=(_realsense_worker if settings.get('camera_type') == 'realsense_d455' else _camera_worker),
             args=(self.frame_queue, child_pipe, self.stop_event, settings),
             daemon=True,
         )
         self.process.start()
         child_pipe.close()
-        if not parent_pipe.poll(20):
+        if not parent_pipe.poll(180):
             self._stop_camera()
             raise RuntimeError('相机启动超时，请检查设备连接和 SDK')
         try:
@@ -369,6 +532,7 @@ class LiveReconstruction:
         return detail
 
     def _stop_camera(self):
+        self.continuous_capture = False
         if self.stop_event is not None:
             self.stop_event.set()
         if self.process is not None:
@@ -389,28 +553,45 @@ class LiveReconstruction:
                 self.message = '相机正在运行；请先停止，再点击开始使新参数生效'
                 return self._status()
             self.stop()
-            self.camera_settings = settings or self.camera_settings
+            self.camera_settings = {**self.camera_settings, **(settings or {})}
             self.software_settings = software_settings or self.software_settings
+            self.camera_settings['foreground']['enabled'] = True
+            default_checkpoint(self.camera_settings['stereo_method'])
             detail = self._launch_camera(self.camera_settings)
 
-            stamp = datetime.now().strftime('realtime_%Y%m%d_%H%M%S')
-            self.raw_dir = _project_path(self.config['paths']['data_root_path']) / stamp
-            self.output_dir = _project_path(self.config['paths']['save_dir']) / stamp
-            for name in ('gray', 'depth', 'mask', 'sdk_depth_mm', 'sdk_mask'):
+            if self.camera_settings['camera_type'] == 'realsense_d455':
+                calibration = detail['calibration']
+                self.camera_matrix = np.asarray(calibration['camera_matrix'], dtype=np.float64)
+                self.image_size = tuple(calibration['image_size'])
+            else:
+                self._load_shengxiang_calibration()
+            stamp = datetime.now().strftime('realtime_%Y%m%d_%H%M%S_%f')
+            camera_type = self.camera_settings['camera_type']
+            self.raw_dir = _camera_storage_root(self.config['paths']['data_root_path'], camera_type) / stamp
+            self.output_dir = _camera_storage_root(self.config['paths']['save_dir'], camera_type) / stamp
+            for name in ('gray', 'depth', 'depth_full', 'mask', 'sdk_depth_mm', 'sdk_mask', 'right', 'rgb', 'foreground_mask', 'aligned_depth_mm', 'stereo_depth_mm', 'left_ir'):
                 (self.raw_dir / name).mkdir(parents=True, exist_ok=True)
+            calibration_path = _project_path(self.config['paths']['int_yaml_path']) if self.camera_settings['camera_type'] == 'shengxiang' else self.raw_dir / 'intrinsics.yaml'
+            if self.camera_settings['camera_type'] == 'realsense_d455':
+                with calibration_path.open('w', encoding='utf-8') as calibration_file:
+                    yaml.safe_dump(dict(rgb_intrinsics=dict(
+                        fx=float(self.camera_matrix[0, 0]), fy=float(self.camera_matrix[1, 1]),
+                        cx=float(self.camera_matrix[0, 2]), cy=float(self.camera_matrix[1, 2]),
+                        width=self.image_size[0], height=self.image_size[1]),
+                        distortion_coefficients=[0.] * 5), calibration_file)
             recon = self.config['reconstruction']
             seg = self.config['segmentation']
             reconstruction = Reconstruction(
                 data_root_path=str(self.raw_dir),
-                color_ext_yaml_path=str(_project_path(self.config['paths']['int_yaml_path'])),
-                aruco_board_yaml_path=str(_project_path(self.config['paths']['aruco_board_yaml_path'])),
+                color_ext_yaml_path=str(calibration_path),
+                aruco_board_yaml_path=str(_project_path(self.camera_settings['aruco_board_yaml_path'])),
                 aruco_length=recon['aruco_length'],
                 world_voxel_size_mm=recon['world_voxel_size_mm'],
                 method=recon['stereo_method'],
                 use_aruco=True,
                 brightness_mask_enabled=recon['brightness_mask']['enabled'],
                 brightness_threshold=recon['brightness_mask']['threshold'],
-                use_sem=seg['enabled'],
+                use_sem=False,
                 segmentation_method=seg['method'],
                 sam_model_path=seg['sam_model_path'],
                 yolo_model_path=seg['yolo_model_path'],
@@ -432,6 +613,7 @@ class LiveReconstruction:
                 json.dump({
                     'config': str(self.config_path),
                     'device': detail,
+                    'aruco_board_yaml_path': str(_project_path(self.camera_settings['aruco_board_yaml_path'])),
                     'camera_matrix': self.camera_matrix.tolist(),
                     'image_size': list(self.image_size),
                     'camera_settings': self.camera_settings,
@@ -442,13 +624,18 @@ class LiveReconstruction:
             self.captured_count = 0
             self.last_captured_sequence = -1
             self.global_display_path = None
+            self.full_global_cloud = o3d.geometry.PointCloud()
+            self.full_global_display_path = None
             self.pose_summaries = {}
             self.latest = self.latest_raw = self.latest_stats = None
+            self._last_preview_raw = None
             self.message = f'相机运行中：{detail.get("name", "设备已连接")}'
             return self._status()
 
     def poll(self):
+        timer = StageTimer()
         with self.lock:
+            timer.mark('lock_wait')
             if self.process is None:
                 return None, None, None, self._status()
             if self.status_pipe.poll():
@@ -463,13 +650,91 @@ class LiveReconstruction:
                     self.message = '相机进程已退出，请重新开始'
                 return None, None, None, self._status()
             self._drain_frames()
+            timer.mark('receive_frame')
             if self.latest is None:
                 return None, None, None, self._status()
             _, gray, depth, mask = self.latest
-            return gray, _depth_preview(depth), mask, self._status()
+            raw_frame = self.latest_raw
+            extra = raw_frame[5] if len(raw_frame) > 5 else {}
+            depth_range = self.config['reconstruction']['depth_range_mm'].copy()
+            status = self._status()
+            log_preview = 'timings_ms' in extra and getattr(self, '_last_preview_raw', None) is not raw_frame
+            if log_preview:
+                self._last_preview_raw = raw_frame
+
+        # Frame arrays are read-only here. Render outside the capture lock and
+        # resize first; full-resolution arrays remain available to reconstruction.
+        height, width = depth.shape
+        scale = min(1., 640. / max(height, width))
+        preview_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        image = extra.get('rgb', gray)
+        if (image.shape[1], image.shape[0]) != preview_size:
+            image = cv2.resize(image, preview_size, interpolation=cv2.INTER_AREA)
+        preview = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if 'rgb' in extra else image
+        original_depth = np.asarray(extra.get('aligned_depth_mm', raw_frame[1]))
+        if (original_depth.shape[1], original_depth.shape[0]) != preview_size:
+            original_depth = cv2.resize(original_depth, preview_size, interpolation=cv2.INTER_NEAREST)
+        if (width, height) != preview_size:
+            depth = cv2.resize(depth, preview_size, interpolation=cv2.INTER_NEAREST)
+        timer.mark('resize_preview')
+        original_depth = np.where(
+            np.isfinite(original_depth) & (original_depth > 0)
+            & (original_depth >= float(depth_range['min']))
+            & (original_depth <= min(float(depth_range['max']), 65535)), original_depth, 0)
+        color_range = _depth_color_range(original_depth)
+        timer.mark('depth_color_range')
+        depth_preview = _depth_preview(original_depth, color_range)
+        segmented_preview = _depth_preview(depth, color_range)
+        timer.mark('colorize_preview')
+        if log_preview:
+            extra['preview_timings_ms'] = timer.finish()
+            print(f'[Preview frame {raw_frame[0]}] {timing_summary(extra["preview_timings_ms"])}', flush=True)
+        return preview, depth_preview, segmented_preview, status
+
+    def start_continuous_capture(self, interval):
+        interval = float(interval)
+        if not np.isfinite(interval) or interval < 0:
+            raise ValueError('连续拍摄间隔须为不小于 0 秒的有限数值')
+        with self.lock:
+            if self.reconstruction is None or self.process is None or not self.process.is_alive():
+                raise RuntimeError('请先点击开始并等待相机画面')
+            self.capture_interval = interval
+            self.next_capture_at = 0.0
+            self.continuous_capture = True
+            self.message = f'连续拍摄已开启，间隔 {interval:g} 秒'
+            return self._status()
+
+    def stop_continuous_capture(self):
+        with self.lock:
+            self.continuous_capture = False
+            self.message = '连续拍摄已停止，相机继续预览'
+            return self._status()
+
+    def continuous_capture_tick(self):
+        with self.lock:
+            if not self.continuous_capture or perf_counter() < self.next_capture_at:
+                return (gr.skip(),) * 10
+            if self.process is None or not self.process.is_alive():
+                self.continuous_capture = False
+                self.message = '连续拍摄已停止：相机未运行'
+                return (self._status(),) + (gr.skip(),) * 9
+            try:
+                self._drain_frames()
+                if self.latest is None or self.latest[0] == self.last_captured_sequence:
+                    return (gr.skip(),) * 10
+                return self.capture()
+            except Exception as exc:
+                self.continuous_capture = False
+                self.message = f'连续拍摄已停止：{exc}'
+                return (self._status(),) + (gr.skip(),) * 9
+            finally:
+                # Zero interval captures the next available frame without an added delay.
+                self.next_capture_at = perf_counter() + self.capture_interval
 
     def capture(self):
+        timer = StageTimer()
         with self.lock:
+            timer.mark('lock_wait')
             if self.reconstruction is None or self.process is None or not self.process.is_alive():
                 raise RuntimeError('请先点击开始并等待相机画面')
             self._drain_frames()
@@ -478,14 +743,10 @@ class LiveReconstruction:
             sequence, gray, depth, mask = self.latest
             if sequence == self.last_captured_sequence:
                 raise RuntimeError('尚未收到新帧，请稍后再拍摄')
-            if not np.any(depth):
-                diagnostic_dir = self.raw_dir / 'diagnostics'
-                diagnostic_dir.mkdir(parents=True, exist_ok=True)
-                np.save(diagnostic_dir / f'sdk_depth_{sequence:06d}.npy', self.latest_raw[1])
-                cv2.imwrite(str(diagnostic_dir / f'sdk_mask_{sequence:06d}.png'), self.latest_raw[3])
-                raise RuntimeError(f'当前帧没有有效深度；SDK 原始数据已保存到 {diagnostic_dir}')
             raw_depth = self.latest_raw[1]
             raw_mask = self.latest_raw[3]
+            right = self.latest_raw[4] if len(self.latest_raw) > 4 else None
+            extra = self.latest_raw[5] if len(self.latest_raw) > 5 else {}
             raw_stats = self.latest_stats.copy()
             idx = self.captured_count
             sample = {
@@ -493,35 +754,76 @@ class LiveReconstruction:
                 'gray_left': gray.copy(),
                 'depth': depth.copy(),
                 'mask': mask.copy(),
-                'rgb': None,
+                'rgb': extra.get('rgb'),
                 'camera_params': {
                     'K1': self.camera_matrix,
                     'min_dis': float(self.config['reconstruction']['depth_range_mm']['min']),
                     'max_dis': float(self.config['reconstruction']['depth_range_mm']['max']),
                 },
             }
-            result = self.reconstruction.process_frame(sample)
-            pose_summary = _aruco_summary(
-                result['aruco_est_frame'], result['frame_pose'], self.reconstruction.aruco_estimater
-            )
-            # Persist raw inputs only after successful reconstruction; repeat clicks
-            # cannot overwrite a previous captured frame.
+            timer.mark('receive_prepare_sample')
+            # Save every captured RGB-D frame before checking foreground or poses.
             for folder, image in (('gray', gray), ('depth', depth), ('mask', mask)):
                 path = self.raw_dir / folder / f'frame_{idx:04d}.png'
                 if not cv2.imwrite(str(path), image):
                     raise OSError(f'无法保存 {path}')
+            if right is not None and not cv2.imwrite(str(self.raw_dir / 'right' / f'frame_{idx:04d}.png'), right):
+                raise OSError('无法保存右红外图')
+            for folder, key in (('rgb', 'rgb'), ('foreground_mask', 'foreground'), ('left_ir', 'left')):
+                if key in extra and not cv2.imwrite(str(self.raw_dir / folder / f'frame_{idx:04d}.png'), extra[key]):
+                    raise OSError(f'无法保存 {folder}')
+            for key in ('aligned_depth_mm', 'stereo_depth_mm'):
+                if key in extra:
+                    np.save(self.raw_dir / key / f'frame_{idx:04d}.npy', extra[key])
             np.save(self.raw_dir / 'sdk_depth_mm' / f'frame_{idx:04d}.npy', raw_depth)
             sdk_mask_path = self.raw_dir / 'sdk_mask' / f'frame_{idx:04d}.png'
             if not cv2.imwrite(str(sdk_mask_path), raw_mask):
                 raise OSError(f'无法保存 {sdk_mask_path}')
+            full_depth_mm = np.asarray(extra.get('aligned_depth_mm', raw_depth))
+            full_depth = np.zeros(full_depth_mm.shape, dtype=np.uint16)
+            valid = np.isfinite(full_depth_mm) & (full_depth_mm > 0) & (full_depth_mm <= 65535)
+            full_depth[valid] = np.rint(full_depth_mm[valid]).astype(np.uint16)
+            full_depth_path = self.raw_dir / 'depth_full' / f'frame_{idx:04d}.png'
+            if not cv2.imwrite(str(full_depth_path), full_depth):
+                raise OSError(f'无法保存 {full_depth_path}')
+            # Keep captured images visible beside session.json, including failed frames.
+            output_images = [('gray', gray), ('depth_full', full_depth)]
+            if 'rgb' in extra:
+                output_images.append(('rgb', extra['rgb']))
+            for folder, image in output_images:
+                output_folder = self.output_dir / folder
+                output_folder.mkdir(parents=True, exist_ok=True)
+                output_path = output_folder / f'frame_{idx:04d}.png'
+                if not cv2.imwrite(str(output_path), image):
+                    raise OSError(f'无法保存 {output_path}')
+            timer.mark('save_raw_inputs')
+            # A saved frame owns its index even if reconstruction later fails.
+            self.captured_count += 1
+            self.last_captured_sequence = sequence
+            self.message = f'第 {idx + 1} 帧 RGB-D 已保存到 {self.raw_dir}'
+            try:
+                result = self.reconstruction.process_frame(sample)
+                full_cloud_path, full_world_path = self._save_unsegmented_cloud(
+                    idx, gray, extra.get('rgb'), result['frame_pose'])
+                timer.mark('reconstruct')
+                pose_summary = _aruco_summary(
+                    result['aruco_est_frame'], result['frame_pose'], self.reconstruction.aruco_estimater
+                )
+                timer.mark('aruco_summary')
+            except Exception as exc:
+                return self._capture_without_cloud(
+                    idx, sequence, raw_stats, f'重建失败：{exc}')
             self.reconstruction.save_frame_result(result)
+            timer.mark('save_frame_result')
             if len(self.reconstruction.global_cloud.points) > 0:
                 fused = self.reconstruction.global_cloud.voxel_down_sample(
                     voxel_size=self.reconstruction.world_voxel_size_mm
                 )
+                timer.mark('global_voxel_downsample')
                 if not o3d.io.write_point_cloud(self.reconstruction.global_cloud_path, fused):
                     raise OSError(f'无法保存全局点云 {self.reconstruction.global_cloud_path}')
                 self.global_display_path = self.reconstruction.global_cloud_path
+            timer.mark('save_global_cloud')
             # Save poses after each capture without closing the video writer.
             with open(self.reconstruction.pose_yaml_path, 'w', encoding='utf-8') as pose_file:
                 yaml.safe_dump(
@@ -530,6 +832,10 @@ class LiveReconstruction:
                     allow_unicode=True,
                     sort_keys=False,
                 )
+            timer.mark('save_pose_yaml')
+            capture_timings = timer.finish()
+            print(f'[Capture {idx}] {timing_summary(capture_timings)}', flush=True)
+            print(f'[Reconstruction {idx}] {timing_summary(result["timings_ms"])}', flush=True)
             with (self.output_dir / 'captures.jsonl').open('a', encoding='utf-8') as log_file:
                 log_file.write(json.dumps({
                     'idx': idx,
@@ -537,21 +843,86 @@ class LiveReconstruction:
                     'aruco_pose_found': result['frame_pose'] is not None,
                     'aruco': pose_summary,
                     'raw_depth_stats': raw_stats,
+                    'timings_ms': {
+                        'camera': extra.get('timings_ms'),
+                        'stereo': extra.get('stereo_timings_ms'),
+                        'delivery_age_ms': extra.get('delivery_age_ms'),
+                        'receive': extra.get('receive_timings_ms'),
+                        'preview': extra.get('preview_timings_ms'),
+                        'reconstruction': result['timings_ms'],
+                        'capture_before_log': capture_timings,
+                    },
                     'cloud': str(self.output_dir / 'cloud' / f'cloud_{idx:04d}.ply'),
+                    'cloud_full': full_cloud_path,
+                    'cloud_world_full': full_world_path,
+                    'global_cloud_full': self.full_global_display_path,
                 }, ensure_ascii=False) + '\n')
-            self.captured_count += 1
-            self.last_captured_sequence = sequence
             self.pose_summaries[idx] = pose_summary
             cloud_path = self.output_dir / 'cloud' / f'cloud_{idx:04d}.ply'
-            self.message = f'已拍摄第 {idx + 1} 帧；{pose_summary["位姿状态"]}'
+            cloud_display = str(cloud_path) if cloud_path.is_file() else None
+            foreground_status = '前景深度为空；' if not np.any(depth) else ''
+            self.message = (f'已拍摄第 {idx + 1} 帧；RGB-D 已保存；{foreground_status}'
+                            f'{pose_summary["位姿状态"]}；未分割全局点云 {len(self.full_global_cloud.points)} 个点')
             choices = [(f'第 {i + 1} 帧 · {i:04d}', i) for i in range(self.captured_count)]
             pose_image = None if result['pose_vis'] is None else cv2.cvtColor(result['pose_vis'], cv2.COLOR_BGR2RGB)
+            timer.mark('log_and_ui_prepare')
+            print(f'[Capture complete {idx}] {timing_summary(timer.finish())}', flush=True)
             return (
                 self._status(), gr.update(choices=choices, value=idx),
-                str(cloud_path), str(cloud_path),
+                cloud_display, cloud_display,
                 self.global_display_path, self.global_display_path,
                 pose_image, pose_summary,
+                self.full_global_display_path, self.full_global_display_path,
             )
+
+    def _save_unsegmented_cloud(self, idx, gray, rgb, frame_pose):
+        """Retain every valid depth pixel, independently of foreground filters."""
+        depth = _unsegmented_depth(self.latest_raw, self.image_size)
+        color = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB) if rgb is not None else gray
+        cloud = Reconstruction.depth_to_point_cloud(depth, color, self.camera_matrix)
+        if not len(cloud.points):
+            return None, None
+        folder = self.output_dir / 'cloud_full'
+        folder.mkdir(parents=True, exist_ok=True)
+        cloud_path = folder / f'cloud_full_{idx:04d}.ply'
+        if not o3d.io.write_point_cloud(str(cloud_path), cloud):
+            raise OSError(f'无法保存 {cloud_path}')
+        if frame_pose is None:
+            return str(cloud_path), None
+        world = self.reconstruction.aruco_estimater.transform_point_cloud(cloud, frame_pose)
+        world_folder = self.output_dir / 'cloud_world_full'
+        world_folder.mkdir(parents=True, exist_ok=True)
+        world_path = world_folder / f'cloud_world_full_{idx:04d}.ply'
+        if not o3d.io.write_point_cloud(str(world_path), world):
+            raise OSError(f'无法保存 {world_path}')
+        self.full_global_cloud += world
+        global_path = self.output_dir / 'global_cloud_full.ply'
+        if not o3d.io.write_point_cloud(str(global_path), self.full_global_cloud):
+            raise OSError(f'无法保存 {global_path}')
+        self.full_global_display_path = str(global_path)
+        return str(cloud_path), str(world_path)
+
+    def _capture_without_cloud(self, idx, sequence, raw_stats, reason):
+        summary = {'位姿状态': reason, 'RGB-D已保存': True, '原始数据目录': str(self.raw_dir)}
+        self.pose_summaries[idx] = summary
+        self.message = f'已拍摄第 {idx + 1} 帧；RGB-D 已保存；{reason}'
+        with (self.output_dir / 'captures.jsonl').open('a', encoding='utf-8') as log_file:
+            log_file.write(json.dumps({
+                'idx': idx,
+                'camera_sequence': sequence,
+                'aruco_pose_found': False,
+                'aruco': summary,
+                'raw_depth_stats': raw_stats,
+                'cloud': None,
+                'reconstruction_error': reason,
+                'raw_dir': str(self.raw_dir),
+            }, ensure_ascii=False) + '\n')
+        choices = [(f'第 {i + 1} 帧 · {i:04d}', i) for i in range(self.captured_count)]
+        return (
+            self._status(), gr.update(choices=choices, value=idx), None, None,
+            self.global_display_path, self.global_display_path, None, summary,
+            self.full_global_display_path, self.full_global_display_path,
+        )
 
     def select_frame(self, idx):
         with self.lock:
@@ -561,13 +932,12 @@ class LiveReconstruction:
             if not 0 <= frame_idx < self.captured_count:
                 raise ValueError('所选帧不在当前会话中')
             cloud_path = self.output_dir / 'cloud' / f'cloud_{frame_idx:04d}.ply'
-            if not cloud_path.is_file():
-                raise FileNotFoundError(f'单帧点云不存在：{cloud_path}')
             pose_path = self.output_dir / 'aruco_fusion' / 'pose_vis' / f'frame_{frame_idx:04d}.png'
             pose_image = cv2.imread(str(pose_path)) if pose_path.is_file() else None
             if pose_image is not None:
                 pose_image = cv2.cvtColor(pose_image, cv2.COLOR_BGR2RGB)
-            return str(cloud_path), str(cloud_path), pose_image, self.pose_summaries.get(frame_idx)
+            cloud_display = str(cloud_path) if cloud_path.is_file() else None
+            return cloud_display, cloud_display, pose_image, self.pose_summaries.get(frame_idx)
 
     def optimize(self, *graph_values):
         with self.lock:
@@ -591,7 +961,7 @@ class LiveReconstruction:
                 raise ValueError('固定节点序号不能超过当前位姿图节点数')
             result = self.reconstruction.run_global_registration(
                 method=method,
-                use_sem=self.config['segmentation']['enabled'],
+                use_sem=self.reconstruction.use_sem,
                 **(graph_settings if method == 'pose_graph'
                    else self.config['global_registration'][method]),
             )
@@ -621,8 +991,36 @@ class LiveReconstruction:
 
 
 def build_ui(controller):
-    with gr.Blocks(title='盛相实时重建') as demo:
-        gr.Markdown('# 盛相实时重建\n开始后预览相机；拍摄时记录一帧灰度、深度、mask、点云和 ArUco 位姿。')
+    with gr.Blocks(title='双目实时重建') as demo:
+        gr.Markdown('# 盛相 / RealSense D455 实时重建\n开始后预览相机；拍摄时记录一帧灰度、深度、mask、点云和 ArUco 位姿。')
+        camera_type = gr.Dropdown(label='相机类型', choices=[('盛相相机', 'shengxiang'), ('RealSense D455', 'realsense_d455')], value=controller.camera_settings['camera_type'])
+        with gr.Accordion('双目深度推理参数（D455）', open=False):
+            stereo_method = gr.Dropdown(label='双目推理模式', choices=list(STEREO_METHODS), value=controller.camera_settings['stereo_method'])
+            checkpoint = gr.Textbox(label='模型权重路径（FoundationStereo 需同目录 cfg.yaml；Fast 使用序列化权重）', value=controller.camera_settings['checkpoint'])
+            valid_iters = gr.Number(label='推理迭代次数', value=controller.camera_settings['valid_iters'], precision=0)
+            gr.Markdown('D455 固定使用 1280×720 左右红外流和彩色流，关闭投射器，自动曝光；下方盛相专用参数对 D455 不生效。模型加载最多等待 180 秒，预览速度取决于推理耗时。')
+        stereo_method.change(
+            lambda method: (default_checkpoint(method), 8 if method == 'fast_foundation_stereo' else 32),
+            inputs=stereo_method, outputs=[checkpoint, valid_iters], queue=False,
+        )
+        board_choices = [
+            ('四码双板：ID 0–3 / 4–7；码边长 24 mm，中心距 32 mm', 'config/aruco_board/main.yaml'),
+            ('十二码双板：ID 0–11 / 12–23；码边长 27 mm，中心距 36 mm', 'config/aruco_board/shenxiang.yaml'),
+        ]
+        current_board = controller.camera_settings['aruco_board_yaml_path']
+        if current_board not in {value for _, value in board_choices}:
+            board_choices.append((f'配置中的布局：{current_board}', current_board))
+        board_type = gr.Dropdown(label='ArUco 标定板类型', choices=board_choices, value=current_board)
+        gr.Markdown('开始前选择与实物一致的板类型，点击“开始”即加载对应码 ID、布局和尺寸；选择板型无需预先拍摄标定帧。运行中更换板型，请先停止再开始，新会话重新建立世界坐标系，原会话文件保留。')
+        fg = controller.camera_settings['foreground']
+        with gr.Accordion('YOLO 前景分割（两种相机默认启用）', open=True):
+            yolo_weights = gr.Textbox(label='YOLO 分割权重路径', value=fg['weights'])
+            with gr.Row():
+                yolo_conf = gr.Number(label='YOLO 置信度', value=fg['conf'])
+                yolo_imgsz = gr.Number(label='YOLO 推理尺寸', value=fg['imgsz'], precision=0)
+                yolo_device = gr.Textbox(label='YOLO 设备（0 为首张 GPU，cpu 为 CPU，留空自动）', value=str(fg['device']) if fg['device'] is not None else '')
+            gr.Markdown('RealSense 在完整 RGB 上分割，盛相在灰度图转三通道后分割。前景点云与未分割点云分别保存；未分割点云使用全部有效深度，不受前景分割、软件深度范围、亮度掩码、统计滤波或体素降采样影响。ArUco 在完整原图上定位；未解算世界位姿的帧只保存单帧点云，不加入全局融合。参数在停止后重新开始时生效。')
+        foreground_inputs = [yolo_weights, yolo_conf, yolo_imgsz, yolo_device]
         with gr.Accordion('相机拍摄参数（停止后调整，点击开始生效）', open=True):
             with gr.Row():
                 device_index = gr.Number(label='设备序号', value=controller.camera_settings['device_index'], precision=0)
@@ -677,48 +1075,79 @@ def build_ui(controller):
         with gr.Row():
             start = gr.Button('开始', variant='primary')
             capture = gr.Button('拍摄一帧')
+            continuous_start = gr.Button('连续拍摄')
+            continuous_stop = gr.Button('停止连续拍摄')
             optimize = gr.Button('全局图优化')
             stop = gr.Button('停止')
+        capture_interval = gr.Number(label='连续拍摄间隔（秒，0 表示不等待）', value=0.0, minimum=0)
         status = gr.Textbox(label='状态', value='未启动', interactive=False)
         with gr.Row():
-            gray = gr.Image(label='灰度图', interactive=False)
+            gray = gr.Image(label='原图像（D455 RGB / 盛相灰度）', interactive=False)
             depth = gr.Image(label='深度图（伪彩）', interactive=False)
-            mask = gr.Image(label='有效深度 mask', interactive=False)
+            segmented_depth = gr.Image(label='分割后的深度图（伪彩）', interactive=False)
         with gr.Accordion('ArUco 位姿估计', open=True):
             with gr.Row():
                 pose_image = gr.Image(label='pose_vis（当前选中帧）', interactive=False)
                 pose_summary = gr.JSON(label='检测到的板子与码数、世界位姿状态')
         frame_selector = gr.Dropdown(label='选择单帧点云', choices=[], value=None)
         with gr.Row():
-            single_cloud = gr.Model3D(label='单帧点云', display_mode='point_cloud', interactive=False)
-            global_cloud = gr.Model3D(label='全局点云', display_mode='point_cloud', interactive=False)
+            single_cloud = gr.Model3D(label='单帧前景点云', display_mode='point_cloud', interactive=False)
+            global_cloud = gr.Model3D(label='前景全局点云', display_mode='point_cloud', interactive=False)
         with gr.Row():
             single_file = gr.File(label='下载单帧点云', interactive=False)
             global_file = gr.File(label='下载全局点云', interactive=False)
+        full_global_cloud = gr.Model3D(label='未语义分割全局点云（全部有效深度像素）', display_mode='point_cloud', interactive=False)
+        full_global_file = gr.File(label='下载未语义分割全局点云', interactive=False)
         timer = gr.Timer(0.7)
+        capture_timer = gr.Timer(0.2)
 
         def start_from_ui(*values):
-            settings = _camera_settings(*values[:len(camera_inputs)])
-            software_settings = _software_settings(*values[len(camera_inputs):])
+            selected_type, method, model_path, iterations, board_path = values[:5]
+            weights, conf, imgsz, device = values[5:9]
+            camera_values = values[9:9 + len(camera_inputs)]
+            if selected_type == 'realsense_d455':
+                settings = dict(camera_type=selected_type, device_index=int(camera_values[0]),
+                                checkpoint=model_path, valid_iters=int(iterations))
+                if settings['device_index'] < 0 or settings['valid_iters'] < 1:
+                    raise ValueError('设备序号须 ≥ 0，推理迭代次数须 ≥ 1')
+            else:
+                settings = _camera_settings(*camera_values)
+                settings.update(camera_type=selected_type, checkpoint=model_path, valid_iters=int(iterations))
+            settings['stereo_method'] = method
+            settings['aruco_board_yaml_path'] = board_path
+            settings['foreground'] = dict(enabled=True, weights=weights, conf=float(conf), imgsz=int(imgsz), device=device or None)
+            software_settings = _software_settings(*values[9 + len(camera_inputs):])
             already_running = controller.process is not None and controller.process.is_alive()
             message = controller.start(settings, software_settings)
             if already_running:
-                return message, gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip(), gr.skip()
-            return message, gr.update(choices=[], value=None), None, None, None, None, None, None
+                return (message,) + (gr.skip(),) * 9
+            return message, gr.update(choices=[], value=None), None, None, None, None, None, None, None, None
 
         def stop_from_ui():
             message = controller.stop()
             return message, controller.global_display_path, controller.global_display_path
 
         start.click(
-            start_from_ui, inputs=camera_inputs + software_inputs,
-            outputs=[status, frame_selector, single_cloud, single_file, global_cloud, global_file, pose_image, pose_summary],
+            start_from_ui, inputs=[camera_type, stereo_method, checkpoint, valid_iters, board_type] + foreground_inputs + camera_inputs + software_inputs,
+            outputs=[status, frame_selector, single_cloud, single_file, global_cloud, global_file, pose_image, pose_summary, full_global_cloud, full_global_file],
             concurrency_limit=1,
         )
         capture.click(
             controller.capture,
-            outputs=[status, frame_selector, single_cloud, single_file, global_cloud, global_file, pose_image, pose_summary],
+            outputs=[status, frame_selector, single_cloud, single_file, global_cloud, global_file, pose_image, pose_summary, full_global_cloud, full_global_file],
             concurrency_limit=1,
+        )
+        continuous_start.click(
+            controller.start_continuous_capture, inputs=capture_interval, outputs=status,
+            concurrency_limit=1,
+        )
+        continuous_stop.click(
+            controller.stop_continuous_capture, outputs=status, concurrency_limit=1,
+        )
+        capture_timer.tick(
+            controller.continuous_capture_tick,
+            outputs=[status, frame_selector, single_cloud, single_file, global_cloud, global_file, pose_image, pose_summary, full_global_cloud, full_global_file],
+            concurrency_limit=1, show_progress='hidden',
         )
         frame_selector.input(
             controller.select_frame, inputs=frame_selector,
@@ -726,18 +1155,35 @@ def build_ui(controller):
         )
         optimize.click(controller.optimize, inputs=graph_inputs, outputs=[status, global_cloud, global_file], concurrency_limit=1)
         stop.click(stop_from_ui, outputs=[status, global_cloud, global_file], concurrency_limit=1)
-        timer.tick(controller.poll, outputs=[gray, depth, mask, status], concurrency_limit=1, show_progress='hidden')
+        timer.tick(controller.poll, outputs=[gray, depth, segmented_depth, status], concurrency_limit=1, show_progress='hidden')
     return demo
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Shengxiang live reconstruction UI')
-    parser.add_argument('--config', default='config/recon/shenxiang.yaml')
+    parser = argparse.ArgumentParser(description='Shengxiang / RealSense D455 live reconstruction UI')
+    parser.add_argument('--config', default=None, help='软件配置，默认 config/recon/shenxiang.yaml；D455 双目标定读取 biaoding 中的 720p 文件')
+    parser.add_argument('--camera-type', choices=['shengxiang', 'realsense_d455'], default='shengxiang')
+    parser.add_argument('--stereo-method', choices=STEREO_METHODS, default='foundation_stereo')
+    parser.add_argument('--checkpoint', default=None, help='留空时按双目模式选择默认权重')
+    parser.add_argument('--valid-iters', type=int, default=None, help='默认 FoundationStereo 32 次，Fast 8 次')
+    parser.add_argument('--yolo', action='store_true', help=argparse.SUPPRESS)  # Legacy flag; YOLO is always enabled.
+    parser.add_argument('--yolo-weights', default=None)
+    parser.add_argument('--yolo-conf', type=float, default=None)
+    parser.add_argument('--yolo-imgsz', type=int, default=640, help='YOLO 推理尺寸，如 640 或 1280；不改变采集及保存分辨率')
+    parser.add_argument('--yolo-device', default=None)
     parser.add_argument('--device-index', type=int, default=0)
     parser.add_argument('--exposure-3d', type=float, default=100.0, help='手动 3D 曝光强度，0.1–100，默认 100')
     parser.add_argument('--port', type=int, default=7860)
     args = parser.parse_args()
-    controller = LiveReconstruction(args.config, args.device_index, args.exposure_3d)
+    config_path = args.config or 'config/recon/shenxiang.yaml'
+    controller = LiveReconstruction(config_path, args.device_index, args.exposure_3d,
+                                    args.camera_type, args.checkpoint, args.valid_iters, stereo_method=args.stereo_method)
+    if args.camera_type == 'realsense_d455' and args.config is None:
+        controller.camera_settings['aruco_board_yaml_path'] = 'config/aruco_board/main.yaml'
+    foreground = controller.camera_settings['foreground']
+    for key, value in [('weights', args.yolo_weights), ('conf', args.yolo_conf), ('imgsz', args.yolo_imgsz), ('device', args.yolo_device)]:
+        if value is not None:
+            foreground[key] = value
     try:
         build_ui(controller).queue().launch(server_name='127.0.0.1', server_port=args.port)
     finally:

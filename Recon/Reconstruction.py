@@ -9,6 +9,7 @@ import numpy as np
 import open3d as o3d
 import yaml
 
+from Recon.timing import StageTimer
 from Recon.Aruco_pose import Aruco_pose_Estimater
 
 
@@ -713,6 +714,7 @@ class Reconstruction(object):
         return masked_depth
 
     def process_frame(self, sample):
+        timer = StageTimer()
         idx = sample['idx']
         camera_params = sample['camera_params']
         disparity_raw = None
@@ -734,10 +736,16 @@ class Reconstruction(object):
         self.depth_list.append(depth)
         # 推理深度图
 
+        timer.mark('depth_prepare')
         rgb = None
         aruco_est_frame = sample['gray_left']
         point_cloud_camera_matrix = camera_params['K1']
-        if sample['rgb'] is not None:
+        if sample['rgb'] is not None and self.input_mode == 'direct_depth':
+            rgb = np.asarray(sample['rgb'])
+            if rgb.shape[:2] != depth.shape:
+                raise ValueError('direct_depth RGB must already be aligned to depth')
+            aruco_est_frame = rgb
+        elif sample['rgb'] is not None:
             rgbd = self.jiegouguang.get_rgbd(depth_L=depth, rgb_img=sample['rgb'])
             rgb = rgbd[:, :, :3].astype(np.uint8)
             depth = rgbd[:, :, 3].astype(np.uint16)
@@ -745,15 +753,18 @@ class Reconstruction(object):
             point_cloud_camera_matrix = self.jiegouguang.color_mapper.K_RGB
         # 如果有RGB就执行反投影
 
+        timer.mark('rgb_align')
         frame_pose = None
         pose_vis = None
         if self.use_aruco:
             frame_pose = self.aruco_estimater.estimate_pose_from_frame(aruco_est_frame)
             if frame_pose == None:
                 print("frame_pose None")
+            timer.mark('aruco_estimate')
             pose_vis = self.aruco_estimater.draw_pose_visualization(aruco_est_frame, frame_pose, idx)
         # 如果有aruco就用aruco估计位姿
 
+        timer.mark('aruco_visualize')
         sam_results = None
         if self.use_sem:
             sam_mask = self.segment_frame(rgb, depth.shape)
@@ -769,9 +780,11 @@ class Reconstruction(object):
             }
         # 如果有语义分割就识别目标并且分割
 
+        timer.mark('semantic_segment')
         point_cloud_color = rgb
         if self.input_mode == 'direct_depth':
-            point_cloud_color = sample['gray_left']
+            point_cloud_color = (cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+                                 if rgb is not None else sample['gray_left'])
             pcd = self.depth_to_point_cloud(
                 depth, point_cloud_color, point_cloud_camera_matrix
             )
@@ -783,7 +796,9 @@ class Reconstruction(object):
             )
         if len(pcd.colors) == 0:
             pcd.colors = o3d.utility.Vector3dVector(np.repeat([[1.0, 0.0, 0.0]], len(pcd.points), axis=0))
+        timer.mark('depth_to_cloud')
         pcd = self.filter_frame_point_cloud(pcd)
+        timer.mark('cloud_filter')
         # 生成点云
 
         pcd_world = None
@@ -791,14 +806,19 @@ class Reconstruction(object):
             pcd_world = self.aruco_estimater.transform_point_cloud(pcd, frame_pose)
         # 如果上面ARUCO估计了位姿就计算全局点云
 
+        timer.mark('cloud_to_world')
         pcd_sam = None
         pcd_sam_world = None
         if sam_results is not None:
-            pcd_sam = self.jiegouguang.depth2pointcloud(
-                sam_results['depth_sam'],
-                color_image=sam_results['rgb_sam'],
-                camera_matrix=point_cloud_camera_matrix,
-            )
+            if self.input_mode == 'direct_depth':
+                pcd_sam = self.depth_to_point_cloud(sam_results['depth_sam'],
+                    cv2.cvtColor(sam_results['rgb_sam'], cv2.COLOR_BGR2RGB), point_cloud_camera_matrix)
+            else:
+                pcd_sam = self.jiegouguang.depth2pointcloud(
+                    sam_results['depth_sam'],
+                    color_image=sam_results['rgb_sam'],
+                    camera_matrix=point_cloud_camera_matrix,
+                )
             if len(pcd_sam.colors) == 0:
                 pcd_sam.colors = o3d.utility.Vector3dVector(np.repeat([[0.0, 1.0, 0.0]], len(pcd_sam.points), axis=0))
             pcd_sam = self.filter_semantic_point_cloud(pcd_sam)
@@ -807,6 +827,7 @@ class Reconstruction(object):
         # 如果有语义分割就得到全局和局部的分割后的点云
 
 
+        timer.mark('semantic_cloud')
         pose_record = None
         if frame_pose is not None:
             if 'rotation_world_to_cam' in frame_pose and 'translation_world_to_cam' in frame_pose:
@@ -821,7 +842,9 @@ class Reconstruction(object):
             }
         # 记录位姿
 
+        timer.mark('pose_record')
         return {
+            'timings_ms': timer.finish(),
             'idx': idx,
             'sample': sample,
             'disparity': disparity_raw,

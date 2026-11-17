@@ -11,6 +11,7 @@ import torch
 import numpy as np
 import cv2
 import contextlib
+from time import perf_counter
 from typing import Tuple, Optional, Dict, Any
 from omegaconf import OmegaConf
 
@@ -102,7 +103,7 @@ class StereoInference:
         self.model = FoundationStereo(self.args)
 
         # Load checkpoint
-        ckpt = torch.load(ckpt_path, map_location=self.device, weights_only=False)
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         self.model.load_state_dict(ckpt['model'])
 
         # Move to device and set eval mode
@@ -122,7 +123,8 @@ class StereoInference:
               baseline_m: float,
               R1: Optional[np.ndarray] = None,
               to_original_left_cam: bool = False,
-              valid_iters: int = 32) -> Dict[str, np.ndarray]:
+              valid_iters: int = 32,
+              timings: Optional[Dict[str, float]] = None) -> Dict[str, np.ndarray]:
         """
         Perform stereo inference on rectified image pair.
 
@@ -134,6 +136,7 @@ class StereoInference:
             R1: Optional rotation matrix (3, 3) from rectified to original left camera
             to_original_left_cam: If True and R1 provided, transform points to original frame
             valid_iters: Number of refinement iterations
+            timings: Optional output dict of stage wall times in ms (CUDA synchronized).
 
         Returns:
             Dictionary containing:
@@ -142,6 +145,20 @@ class StereoInference:
             - points_cam1: (H, W, 3) point cloud in left camera coordinates (meters)
             - valid_mask: (H, W) boolean mask for valid depth values
         """
+        def boundary():
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+            return perf_counter()
+
+        started = previous = boundary() if timings is not None else 0.
+
+        def mark(name):
+            nonlocal previous
+            if timings is not None:
+                now = boundary()
+                timings[name] = (now - previous) * 1000.
+                previous = now
+
         # Input validation
         assert left_img_bgr.shape == right_img_bgr.shape, "Image shapes must match"
         # assert len(left_img_bgr.shape) == 3 and left_img_bgr.shape[2] == 3, "Images must be (H,W,3)"
@@ -166,16 +183,24 @@ class StereoInference:
         padder = InputPadder(left_tensor.shape, divis_by=32, force_square=False)
         left_padded, right_padded = padder.pad(left_tensor, right_tensor)
 
+        mark('input_convert_upload_pad')
+
         # Run inference
         autocast_ctx = torch.cuda.amp.autocast if self.device.type == 'cuda' else contextlib.nullcontext
         autocast_kwargs = {'enabled': True} if self.device.type == 'cuda' else {}
 
-        with autocast_ctx(**autocast_kwargs):
+        # Gradient mode is thread-local: Gradio may infer on a different worker
+        # from the one that constructed the model.
+        with torch.inference_mode(), autocast_ctx(**autocast_kwargs):
             disp_padded = self.model.forward(left_padded, right_padded, iters=valid_iters, test_mode=True)
+
+        mark('network_forward')
 
         # Unpad and convert to numpy
         disp_tensor = padder.unpad(disp_padded.float())
         disp_pred = disp_tensor.squeeze().cpu().numpy()
+
+        mark('unpad_download')
 
         # Handle resolution mismatch - resize disparity and scale values
         if disp_pred.shape != (H, W):
@@ -191,6 +216,8 @@ class StereoInference:
         depth = np.zeros_like(disp_pred)
         depth[valid_mask] = fx * baseline_m / disp_pred[valid_mask]
 
+        mark('disparity_to_depth')
+
         # Generate 3D points in camera coordinates
         points_cam1 = self._disparity_to_points(disp_pred, K_rect, baseline_m, valid_mask)
 
@@ -198,6 +225,10 @@ class StereoInference:
         if to_original_left_cam and R1 is not None:
             assert R1.shape == (3, 3), "R1 must be (3,3)"
             points_cam1 = self._transform_points(points_cam1, R1.T, valid_mask)
+
+        mark('generate_points_transform')
+        if timings is not None:
+            timings['total_ms'] = (perf_counter() - started) * 1000.
 
         return {
             'disparity': disp_pred,
