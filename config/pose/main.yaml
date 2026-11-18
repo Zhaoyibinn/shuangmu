@@ -21,7 +21,7 @@ point_cloud:
   max_depth_mm: 1000.0
 
 segmentation:
-  yolo_model_path: huojian/d455_penguan_20260525/video/huojian-600-640.pt
+  yolo_model_path: jiegouguang/weights/yolo/suobipengguan_new/last.pt
   yolo_conf: 0.25
   yolo_imgsz: 640
   yolo_device: null

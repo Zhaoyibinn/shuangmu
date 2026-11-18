@@ -15,8 +15,8 @@ class ForegroundSegmenter:
         if not path.is_file():
             raise FileNotFoundError(f'请复制 YOLO 分割权重到：{path}')
         self.model = import_yolo()(str(path))
-        if self.model.task != 'segment':
-            raise ValueError('需要 YOLO 分割权重（segment），不能使用检测权重')
+        if self.model.task not in ('segment', 'semantic'):
+            raise ValueError('需要 YOLO 分割权重（segment 或 semantic），不能使用检测权重')
         self.conf, self.imgsz, self.device = float(conf), int(imgsz), device
         if not 0 <= self.conf <= 1 or self.imgsz <= 0:
             raise ValueError('YOLO conf 必须在 0–1，imgsz 必须 > 0')
@@ -28,6 +28,25 @@ class ForegroundSegmenter:
             kwargs['device'] = self.device
         results = self.model.predict(**kwargs)
         foreground = np.zeros(bgr.shape[:2], dtype=bool)
+        if self.model.task == 'semantic':
+            if not results or results[0].semantic_mask is None:
+                raise ValueError('YOLO semantic 模型未返回 semantic_mask')
+            result = results[0]
+            class_map = result.semantic_mask.data.cpu().numpy()
+            # Ultralytics binary semantic models use 0=background, 1=foreground,
+            # even though names contains only the target class at index 0.
+            if len(result.names) == 1:
+                foreground = class_map == 1
+            else:
+                foreground_ids = [
+                    class_id for class_id, name in result.names.items()
+                    if str(name).strip().lower() not in ('background', '_background_', '__background__', 'bg', '背景')
+                ]
+                foreground = np.isin(class_map, foreground_ids)
+            # Semantic predictions are already scaled to the original image.
+            if foreground.shape != bgr.shape[:2]:
+                raise ValueError('YOLO semantic_mask 与输入 RGB 尺寸不一致')
+            return foreground
         if results and results[0].masks is not None:
             for mask in results[0].masks.data:
                 foreground |= Reconstruction.align_letterbox_mask(mask.cpu().numpy() > .5, foreground.shape)

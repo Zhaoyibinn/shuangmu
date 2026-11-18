@@ -193,6 +193,7 @@ def history_plot(records, index, selected_curves=None):
                 y=[records[index][field] for field, _, _ in fields],
                 mode='markers', name='回放帧', marker=dict(size=10, symbol='circle-open', color='#333333')))
     figure.update_layout(xaxis_title='原始帧序号', yaxis_title='角度 / °',
+                         yaxis=dict(range=[-45, 45], autorange=False, fixedrange=False),
                          hovermode='x unified', uirevision='pose-angle-history',
                          margin=dict(l=55, r=20, t=25, b=45))
     return figure
